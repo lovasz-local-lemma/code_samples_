@@ -1,0 +1,77 @@
+--- upstream/photon_map/PhotonMapIntegrator.hpp
++++ this-branch/photon-map/PhotonMapIntegrator.hpp
+@@ -1,2 +1,5 @@
++// Review copy of an altered Tungsten research branch. See README.md and LICENSE.txt.
++// Formatting/comment cleanup only; host-renderer dependencies are not bundled.
++
+ #ifndef PHOTONMAPINTEGRATOR_HPP_
+ #define PHOTONMAPINTEGRATOR_HPP_
+@@ -20,4 +23,8 @@
+ #include <memory>
+ #include <vector>
++
++#include <bvh/BinaryBvh.hpp>
++
++#include "PhotonPrimitiveIntegrator.hpp"
+ 
+ namespace Tungsten
+@@ -59,14 +66,25 @@
+         std::vector<Photon> _surfacePhotons;
+         std::vector<VolumePhoton> _volumePhotons;
++
+         std::vector<PathPhoton> _pathPhotons;
+         std::unique_ptr<PhotonBeam[]> _beams;
+         std::unique_ptr<PhotonPlane0D[]> _planes0D;
+         std::unique_ptr<PhotonPlane1D[]> _planes1D;
++        std::unique_ptr<PhotonPrimitive[]> _primitives;
++
++        std::unique_ptr<PhotonVolume[]> _volumes;
++
+         uint32 _pathPhotonCount;
+ 
+         std::unique_ptr<KdTree<Photon>> _surfaceTree;
+         std::unique_ptr<KdTree<VolumePhoton>> _volumeTree;
++
+         std::unique_ptr<Bvh::BinaryBvh> _volumeBvh;
+         std::unique_ptr<GridAccel> _volumeGrid;
++
++        std::unique_ptr<Bvh::BinaryBvh> _volumeBvh_DBG;
++        std::unique_ptr<GridAccel> _volumeGrid_DBG;
++
++        std::unique_ptr<Bvh::BinaryBvh> _volumeBvh_dangling;
+ 
+         std::vector<std::unique_ptr<PhotonTracer>> _tracers;
+@@ -89,4 +107,21 @@
+         void buildPlaneBvh(uint32 tail, float volumeRadiusScale);
+         void buildPlaneGrid(uint32 tail, float volumeRadiusScale);
++        void makePrimitiveBVH(uint32 tail, float volumeRadiusScale, Bvh::PrimVector &prims_out,
++                              PhotonMapSettings::Primitive_Policy &masterPolicy);
++        void makePathBVH(uint32 tail, float volumeRadiusScale, Bvh::PrimVector &prims_out,
++                         PhotonMapSettings::Primitive_Policy &masterPolicy);
++        void makePathBVH_simple(uint32 tail, float volumeRadiusScale, Bvh::PrimVector &prims_out,
++                                PhotonMapSettings::Primitive_Policy &masterPolicy);
++        void makeDanglingBVH(uint32 tail, float volumeRadiusScale, Bvh::PrimVector &prims_out,
++                             PhotonMapSettings::Primitive_Policy &masterPolicy);
++        void makePrimitiveGrid(uint32 tail, float volumeRadiusScale, Bvh::PrimVector &prims_out,
++                               PhotonMapSettings::Primitive_Policy &masterPolicy);
++        void buildPrimitiveAccStructure(uint32 tail, float volumeRadiusScale);
++        void Add_Dangling_Segments(uint32 tail, bool reuse_dir_when_hit_surface);
++        void Add_Dangling_Segments(uint32 tail);
++        void showPhotonInfo(uint32 k, uint32 tail);
++        void Add_marg_segments(uint32 tail);
++        void PostProcess_PathPhotons(uint32 tail, bool disp);
++        void prepare_PhotonPrimitives(uint32 tail, float volumeRadiusScale);
+         void buildPhotonDataStructures(float volumeRadiusScale);
+ 
+@@ -106,7 +141,10 @@
+         virtual void waitForCompletion() override;
+         virtual void abortRender() override;
++        void precomputeVolume(PhotonVolume &volume, const PathPhoton &p0, const PathPhoton &p1,
++                              const PathPhoton &p2, const PathPhoton &p3);
++        void buildVolumeBvh(uint32 tail, float volumeRadiusScale);
+     };
+ 
+-}
++} // namespace Tungsten
+ 
+ #endif /* PHOTONMAPINTEGRATOR_HPP_ */

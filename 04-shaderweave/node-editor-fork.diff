@@ -1,0 +1,1297 @@
+--- upstream/imgui_node_editor.h
++++ fork/imgui_node_editor.h
+@@ -266,8 +266,8 @@
+         Colors[StyleColor_SelNodeBorder]      = ImColor(255, 176,  50, 255);
+         Colors[StyleColor_NodeSelRect]        = ImColor(  5, 130, 255,  64);
+         Colors[StyleColor_NodeSelRectBorder]  = ImColor(  5, 130, 255, 128);
+-        Colors[StyleColor_HovLinkBorder]      = ImColor( 50, 176, 255, 255);
+-        Colors[StyleColor_SelLinkBorder]      = ImColor(255, 176,  50, 255);
++        Colors[StyleColor_HovLinkBorder]      = ImColor( 50, 120, 250, 200);
++        Colors[StyleColor_SelLinkBorder]      = ImColor(255, 48,  10, 200);
+         Colors[StyleColor_HighlightLinkBorder]= ImColor(204, 105,   0, 255);
+         Colors[StyleColor_LinkSelRect]        = ImColor(  5, 130, 255,  64);
+         Colors[StyleColor_LinkSelRectBorder]  = ImColor(  5, 130, 255, 128);
+@@ -306,7 +306,7 @@
+ IMGUI_NODE_EDITOR_API void Begin(const char* id, const ImVec2& size = ImVec2(0, 0));
+ IMGUI_NODE_EDITOR_API void End();
+ 
+-IMGUI_NODE_EDITOR_API void BeginNode(NodeId id);
++IMGUI_NODE_EDITOR_API void BeginNode(NodeId id, uint32_t traits=0);
+ IMGUI_NODE_EDITOR_API void BeginPin(PinId id, PinKind kind);
+ IMGUI_NODE_EDITOR_API void PinRect(const ImVec2& a, const ImVec2& b);
+ IMGUI_NODE_EDITOR_API void PinPivotRect(const ImVec2& a, const ImVec2& b);
+--- upstream/imgui_node_editor_internal.h
++++ fork/imgui_node_editor_internal.h
+@@ -179,6 +179,19 @@
+ 
+ struct EditorContext;
+ 
++
++
++enum VisualTrait {
++    None = 0,
++    Ribbon = 1 << 0, // 0b0001
++    Lightning = 1 << 1, // 0b0010
++    Fire = 1 << 2, // 0b0100
++    Glow = 1 << 3, // 0b1000
++    Rainbow = 1 << 4
++    // ... add more as needed
++};
++
++
+ struct Node;
+ struct Pin;
+ struct Link;
+@@ -200,6 +213,7 @@
+         return m_ID.AsPointer() < rhs.m_ID.AsPointer();
+     }
+ };
++
+ 
+ struct Object
+ {
+@@ -379,6 +393,9 @@
+ 
+ struct Node final: Object
+ {
++
++    uint32_t traits = VisualTrait::None;
++
+     using IdType = NodeId;
+ 
+     NodeId   m_ID;
+@@ -435,7 +452,10 @@
+     virtual bool IsSelectable() override { return true; }
+ 
+     virtual void Draw(ImDrawList* drawList, DrawFlags flags = None) override final;
+-    void DrawBorder(ImDrawList* drawList, ImU32 color, float thickness = 1.0f, float offset = 0.0f);
++
++    void Draw_Extended(ImDrawList* drawList, DrawFlags flags = None, bool special=false);
++
++    void DrawBorder(ImDrawList* drawList, ImU32 color, float thickness = 1.0f, float offset = 0.0f, bool special=false);
+ 
+     void GetGroupedNodes(std::vector<Node*>& result, bool append = false);
+ 
+@@ -1195,7 +1215,7 @@
+     NodeBuilder(EditorContext* editor);
+     ~NodeBuilder();
+ 
+-    void Begin(NodeId nodeId);
++    void Begin(NodeId nodeId, uint32_t traits=0);
+     void End();
+ 
+     void BeginPin(PinId pinId, PinKind kind);
+--- upstream/imgui_node_editor_api.cpp
++++ fork/imgui_node_editor_api.cpp
+@@ -143,9 +143,9 @@
+     s_Editor->End();
+ }
+ 
+-void ax::NodeEditor::BeginNode(NodeId id)
+-{
+-    s_Editor->GetNodeBuilder().Begin(id);
++void ax::NodeEditor::BeginNode(NodeId id, uint32_t traits)
++{
++    s_Editor->GetNodeBuilder().Begin(id,traits);
+ }
+ 
+ void ax::NodeEditor::BeginPin(PinId id, PinKind kind)
+--- upstream/imgui_node_editor.cpp
++++ fork/imgui_node_editor.cpp
+@@ -253,95 +253,6 @@
+     currentSplitter._Channels.swap(splitter._Channels);
+ }
+ 
+-//static void ImDrawList_TransformChannel_Inner(ImVector<ImDrawVert>& vtxBuffer, const ImVector<ImDrawIdx>& idxBuffer, const ImVector<ImDrawCmd>& cmdBuffer, const ImVec2& preOffset, const ImVec2& scale, const ImVec2& postOffset)
+-//{
+-//    auto idxRead = idxBuffer.Data;
+-//
+-//    int indexOffset = 0;
+-//    for (auto& cmd : cmdBuffer)
+-//    {
+-//        auto idxCount = cmd.ElemCount;
+-//
+-//        if (idxCount == 0) continue;
+-//
+-//        auto minIndex = idxRead[indexOffset];
+-//        auto maxIndex = idxRead[indexOffset];
+-//
+-//        for (auto i = 1u; i < idxCount; ++i)
+-//        {
+-//            auto idx = idxRead[indexOffset + i];
+-//            minIndex = std::min(minIndex, idx);
+-//            maxIndex = ImMax(maxIndex, idx);
+-//        }
+-//
+-//        for (auto vtx = vtxBuffer.Data + minIndex, vtxEnd = vtxBuffer.Data + maxIndex + 1; vtx < vtxEnd; ++vtx)
+-//        {
+-//            vtx->pos.x = (vtx->pos.x + preOffset.x) * scale.x + postOffset.x;
+-//            vtx->pos.y = (vtx->pos.y + preOffset.y) * scale.y + postOffset.y;
+-//        }
+-//
+-//        indexOffset += idxCount;
+-//    }
+-//}
+-
+-//static void ImDrawList_TransformChannels(ImDrawList* drawList, int begin, int end, const ImVec2& preOffset, const ImVec2& scale, const ImVec2& postOffset)
+-//{
+-//    int lastCurrentChannel = drawList->_ChannelsCurrent;
+-//    if (lastCurrentChannel != 0)
+-//        drawList->ChannelsSetCurrent(0);
+-//
+-//    auto& vtxBuffer = drawList->VtxBuffer;
+-//
+-//    if (begin == 0 && begin != end)
+-//    {
+-//        ImDrawList_TransformChannel_Inner(vtxBuffer, drawList->IdxBuffer, drawList->CmdBuffer, preOffset, scale, postOffset);
+-//        ++begin;
+-//    }
+-//
+-//    for (int channelIndex = begin; channelIndex < end; ++channelIndex)
+-//    {
+-//        auto& channel = drawList->_Channels[channelIndex];
+-//        ImDrawList_TransformChannel_Inner(vtxBuffer, channel.IdxBuffer, channel.CmdBuffer, preOffset, scale, postOffset);
+-//    }
+-//
+-//    if (lastCurrentChannel != 0)
+-//        drawList->ChannelsSetCurrent(lastCurrentChannel);
+-//}
+-
+-//static void ImDrawList_ClampClipRects_Inner(ImVector<ImDrawCmd>& cmdBuffer, const ImVec4& clipRect, const ImVec2& offset)
+-//{
+-//    for (auto& cmd : cmdBuffer)
+-//    {
+-//        cmd.ClipRect.x = ImMax(cmd.ClipRect.x + offset.x, clipRect.x);
+-//        cmd.ClipRect.y = ImMax(cmd.ClipRect.y + offset.y, clipRect.y);
+-//        cmd.ClipRect.z = std::min(cmd.ClipRect.z + offset.x, clipRect.z);
+-//        cmd.ClipRect.w = std::min(cmd.ClipRect.w + offset.y, clipRect.w);
+-//    }
+-//}
+-
+-//static void ImDrawList_TranslateAndClampClipRects(ImDrawList* drawList, int begin, int end, const ImVec2& offset)
+-//{
+-//    int lastCurrentChannel = drawList->_ChannelsCurrent;
+-//    if (lastCurrentChannel != 0)
+-//        drawList->ChannelsSetCurrent(0);
+-//
+-//    auto clipRect = drawList->_ClipRectStack.back();
+-//
+-//    if (begin == 0 && begin != end)
+-//    {
+-//        ImDrawList_ClampClipRects_Inner(drawList->CmdBuffer, clipRect, offset);
+-//        ++begin;
+-//    }
+-//
+-//    for (int channelIndex = begin; channelIndex < end; ++channelIndex)
+-//    {
+-//        auto& channel = drawList->_Channels[channelIndex];
+-//        ImDrawList_ClampClipRects_Inner(channel.CmdBuffer, clipRect, offset);
+-//    }
+-//
+-//    if (lastCurrentChannel != 0)
+-//        drawList->ChannelsSetCurrent(lastCurrentChannel);
+-//}
+ 
+ static void ImDrawList_PathBezierOffset(ImDrawList* drawList, float offset, const ImVec2& p0, const ImVec2& p1, const ImVec2& p2, const ImVec2& p3)
+ {
+@@ -355,116 +266,6 @@
+     ImCubicBezierSubdivide(acceptPoint, p0, p1, p2, p3);
+ }
+ 
+-/*
+-static void ImDrawList_PolyFillScanFlood(ImDrawList *draw, std::vector<ImVec2>* poly, ImColor color, int gap = 1, float strokeWidth = 1.0f)
+-{
+-    std::vector<ImVec2> scanHits;
+-    ImVec2 min, max; // polygon min/max points
+-    auto io = ImGui::GetIO();
+-    float y;
+-    bool isMinMaxDone = false;
+-    unsigned int polysize = poly->size();
+-
+-    // find the orthagonal bounding box
+-    // probably can put this as a predefined
+-    if (!isMinMaxDone)
+-    {
+-        min.x = min.y = FLT_MAX;
+-        max.x = max.y = FLT_MIN;
+-        for (auto p : *poly)
+-        {
+-            if (p.x < min.x) min.x = p.x;
+-            if (p.y < min.y) min.y = p.y;
+-            if (p.x > max.x) max.x = p.x;
+-            if (p.y > max.y) max.y = p.y;
+-        }
+-        isMinMaxDone = true;
+-    }
+-
+-    // Bounds check
+-    if ((max.x < 0) || (min.x > io.DisplaySize.x) || (max.y < 0) || (min.y > io.DisplaySize.y)) return;
+-
+-    // Vertically clip
+-    if (min.y < 0) min.y = 0;
+-    if (max.y > io.DisplaySize.y) max.y = io.DisplaySize.y;
+-
+-    // so we know we start on the outside of the object we step out by 1.
+-    min.x -= 1;
+-    max.x += 1;
+-
+-    // Initialise our starting conditions
+-    y = min.y;
+-
+-    // Go through each scan line iteratively, jumping by 'gap' pixels each time
+-    while (y < max.y)
+-    {
+-        scanHits.clear();
+-
+-        {
+-            int jump = 1;
+-            ImVec2 fp = poly->at(0);
+-
+-            for (size_t i = 0; i < polysize - 1; i++)
+-            {
+-                ImVec2 pa = poly->at(i);
+-                ImVec2 pb = poly->at(i + 1);
+-
+-                // jump double/dud points
+-                if (pa.x == pb.x && pa.y == pb.y) continue;
+-
+-                // if we encounter our hull/poly start point, then we've now created the
+-                // closed
+-                // hull, jump the next segment and reset the first-point
+-                if ((!jump) && (fp.x == pb.x) && (fp.y == pb.y))
+-                {
+-                    if (i < polysize - 2)
+-                    {
+-                        fp = poly->at(i + 2);
+-                        jump = 1;
+-                        i++;
+-                    }
+-                }
+-                else
+-                {
+-                    jump = 0;
+-                }
+-
+-                // test to see if this segment makes the scan-cut.
+-                if ((pa.y > pb.y && y < pa.y && y > pb.y) || (pa.y < pb.y && y > pa.y && y < pb.y))
+-                {
+-                    ImVec2 intersect;
+-
+-                    intersect.y = y;
+-                    if (pa.x == pb.x)
+-                    {
+-                        intersect.x = pa.x;
+-                    }
+-                    else
+-                    {
+-                        intersect.x = (pb.x - pa.x) / (pb.y - pa.y) * (y - pa.y) + pa.x;
+-                    }
+-                    scanHits.push_back(intersect);
+-                }
+-            }
+-
+-            // Sort the scan hits by X, so we have a proper left->right ordering
+-            sort(scanHits.begin(), scanHits.end(), [](ImVec2 const &a, ImVec2 const &b) { return a.x < b.x; });
+-
+-            // generate the line segments.
+-            {
+-                int i = 0;
+-                int l = scanHits.size() - 1; // we need pairs of points, this prevents segfault.
+-                for (i = 0; i < l; i += 2)
+-                {
+-                    draw->AddLine(scanHits[i], scanHits[i + 1], color, strokeWidth);
+-                }
+-            }
+-        }
+-        y += gap;
+-    } // for each scan line
+-    scanHits.clear();
+-}
+-*/
+ 
+ static void ImDrawList_AddBezierWithArrows(ImDrawList* drawList, const ImCubicBezierPoints& curve, float thickness,
+     float startArrowSize, float startArrowWidth, float endArrowSize, float endArrowWidth,
+@@ -547,7 +348,6 @@
+ 
+ 
+ 
+-
+ //------------------------------------------------------------------------------
+ //
+ // Pin
+@@ -618,12 +418,13 @@
+ 
+ 
+ 
+-
+ //------------------------------------------------------------------------------
+ //
+ // Node
+ //
+ //------------------------------------------------------------------------------
++
++
+ bool ed::Node::AcceptDrag()
+ {
+     m_DragStart = m_Bounds.Min;
+@@ -692,6 +493,9 @@
+ # endif
+ 
+         DrawBorder(drawList, m_BorderColor, m_BorderWidth);
++
++
++
+     }
+     else if (flags & Selected)
+     {
+@@ -713,16 +517,525 @@
+     }
+ }
+ 
+-void ed::Node::DrawBorder(ImDrawList* drawList, ImU32 color, float thickness, float offset)
+-{
+-    if (thickness > 0.0f)
+-    {
++void ax::NodeEditor::Detail::Node::Draw_Extended(ImDrawList* drawList, DrawFlags flags, bool special)
++{
++    if (flags == Detail::Object::None)
++    {
++        drawList->ChannelsSetCurrent(m_Channel + c_NodeBackgroundChannel);
++
++        drawList->AddRectFilled(
++            m_Bounds.Min,
++            m_Bounds.Max,
++            m_Color, m_Rounding);
++
++        if (IsGroup(this))
++        {
++            drawList->AddRectFilled(
++                m_GroupBounds.Min,
++                m_GroupBounds.Max,
++                m_GroupColor, m_GroupRounding);
++
++            if (m_GroupBorderWidth > 0.0f)
++            {
++                FringeScaleScope fringe(1.0f);
++
++                drawList->AddRect(
++                    m_GroupBounds.Min,
++                    m_GroupBounds.Max,
++                    m_GroupBorderColor, m_GroupRounding, c_AllRoundCornersFlags, m_GroupBorderWidth);
++            }
++        }
++
++# if 0
++        // #debug: highlight group regions
++        auto drawRect = [drawList](const ImRect& rect, ImU32 color)
++        {
++            if (ImRect_IsEmpty(rect)) return;
++            drawList->AddRectFilled(rect.Min, rect.Max, color);
++        };
++
++        drawRect(GetRegionBounds(NodeRegion::Top), IM_COL32(255, 0, 0, 64));
++        drawRect(GetRegionBounds(NodeRegion::Bottom), IM_COL32(255, 0, 0, 64));
++        drawRect(GetRegionBounds(NodeRegion::Left), IM_COL32(0, 255, 0, 64));
++        drawRect(GetRegionBounds(NodeRegion::Right), IM_COL32(0, 255, 0, 64));
++        drawRect(GetRegionBounds(NodeRegion::TopLeft), IM_COL32(255, 0, 255, 64));
++        drawRect(GetRegionBounds(NodeRegion::TopRight), IM_COL32(255, 0, 255, 64));
++        drawRect(GetRegionBounds(NodeRegion::BottomLeft), IM_COL32(255, 0, 255, 64));
++        drawRect(GetRegionBounds(NodeRegion::BottomRight), IM_COL32(255, 0, 255, 64));
++        drawRect(GetRegionBounds(NodeRegion::Center), IM_COL32(0, 0, 255, 64));
++        drawRect(GetRegionBounds(NodeRegion::Header), IM_COL32(0, 255, 255, 64));
++# endif
++
++        DrawBorder(drawList, m_BorderColor, m_BorderWidth, 0.0,special);
++
++    }
++    else if (flags & Selected)
++    {
++        const auto  borderColor = Editor->GetColor(StyleColor_SelNodeBorder);
++        const auto& editorStyle = Editor->GetStyle();
++
++        drawList->ChannelsSetCurrent(m_Channel + c_NodeBaseChannel);
++
++        DrawBorder(drawList, borderColor, editorStyle.SelectedNodeBorderWidth, editorStyle.SelectedNodeBorderOffset, special);
++    }
++    else if (!IsGroup(this) && (flags & Hovered))
++    {
++        const auto  borderColor = Editor->GetColor(StyleColor_HovNodeBorder);
++        const auto& editorStyle = Editor->GetStyle();
++
++        drawList->ChannelsSetCurrent(m_Channel + c_NodeBaseChannel);
++
++        DrawBorder(drawList, borderColor, editorStyle.HoveredNodeBorderWidth, editorStyle.HoverNodeBorderOffset, special);
++    }
++}
++
++
++//void RoundedRectPerimeter(const ImVec2& min, const ImVec2& max, float rounding, int segments, std::vector<ImVec2>& out)
++//{
++//    out.clear();
++//    // 4 corners: TL, TR, BR, BL
++//    ImVec2 TL = min;
++//    ImVec2 TR = ImVec2(max.x, min.y);
++//    ImVec2 BR = max;
++//    ImVec2 BL = ImVec2(min.x, max.y);
++//
++//    const float PI = 3.1415926f;
++//    // Segments per corner
++//    int seg = segments / 4;
++//
++//    // Top-left
++//    for (int i = 0; i < seg; ++i)
++//    {
++//        float a = PI - (i * PI * 0.5f) / (seg - 1);
++//        out.push_back(ImVec2(TL.x + rounding * cosf(a), TL.y + rounding * sinf(a)));
++//    }
++//    // Top-right
++//    for (int i = 0; i < seg; ++i)
++//    {
++//        float a = -PI * 0.5f + (i * PI * 0.5f) / (seg - 1);
++//        out.push_back(ImVec2(TR.x + rounding * cosf(a), TR.y + rounding * sinf(a)));
++//    }
++//    // Bottom-right
++//    for (int i = 0; i < seg; ++i)
++//    {
++//        float a = 0.0f + (i * PI * 0.5f) / (seg - 1);
++//        out.push_back(ImVec2(BR.x + rounding * cosf(a), BR.y + rounding * sinf(a)));
++//    }
++//    // Bottom-left
++//    for (int i = 0; i < seg; ++i)
++//    {
++//        float a = PI * 0.5f + (i * PI * 0.5f) / (seg - 1);
++//        out.push_back(ImVec2(BL.x + rounding * cosf(a), BL.y + rounding * sinf(a)));
++//    }
++//}
++//
++//
++//
++//void DrawBreathingRibbon(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, float rounding, float baseThickness)
++//{
++//    const int segments = 80; // Higher = smoother
++//    std::vector<ImVec2> border;
++//    RoundedRectPerimeter(min, max, rounding, segments, border);
++//
++//    // --- Animate the "bump" ---
++//    float time = ImGui::GetTime();
++//    float perimeter = 0.0f;
++//    std::vector<float> lengths(border.size());
++//    // Calculate cumulative lengths for t-to-distance mapping
++//    for (int i = 1; i < border.size(); ++i)
++//    {
++//        float len = ImLengthSqr(border[i] - border[i - 1]);
++//        lengths[i] = lengths[i - 1] + sqrtf(len);
++//    }
++//    perimeter = lengths.back();
++//
++//    float phase = fmodf(time * 0.25f, 1.0f); // slow rotation, adjust speed here
++//    float bump_pos = phase * perimeter;
++//
++//    // Draw as polyline with modulated thickness/color
++//    for (int i = 0; i < border.size(); ++i)
++//    {
++//        int j = (i + 1) % border.size();
++//        float seg_mid = (lengths[i] + lengths[j]) * 0.5f;
++//
++//        // Distance from bump
++//        float dist = fabsf(seg_mid - bump_pos);
++//        if (dist > perimeter * 0.5f) dist = perimeter - dist; // Looping
++//
++//        // Gaussian bump, sharpness controls width of highlight
++//        float bump = expf(-dist * dist * 0.00025f * perimeter); // tune the multiplier for desired width
++//
++//        // Color and thickness
++//        ImU32 color = IM_COL32(90 + 80 * bump, 200 + 55 * bump, 255, 180 + int(75 * bump));
++//        float thickness = baseThickness * (1.0f + 1.5f * bump);
++//
++//        // Draw segment
++//        drawList->AddLine(border[i], border[j], color, thickness);
++//    }
++//}
++
++//void DrawBreathingRibbon(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, float rounding, float ribbon_width)
++//{
++//    const int segments = 72;
++//    std::vector<ImVec2> inner, outer;
++//    RoundedRectPerimeter(min, max, rounding, segments, inner);
++//    RoundedRectPerimeter(min - ImVec2(ribbon_width, ribbon_width),
++//        max + ImVec2(ribbon_width, ribbon_width),
++//        rounding + ribbon_width, segments, outer);
++//
++//    // Parameters for bump
++//    float time = ImGui::GetTime();
++//    float speed = 0.35f;       // Revolutions per second
++//    float bump_center = fmod(time * speed, 1.0f);
++//    float bump_amp = ribbon_width * 0.6f; // Max bump height
++//    float bump_sharp = 320.0f; // Higher = sharper
++//
++//    // Compute normalized t along the perimeter for each segment
++//    float total_len = 0.0f;
++//    std::vector<float> t_vals(segments, 0.0f);
++//    for (int i = 1; i < segments; ++i) {
++//        total_len += ImLengthSqr(outer[i] - outer[i - 1]);
++//        t_vals[i] = total_len;
++//    }
++//    for (int i = 0; i < segments; ++i) t_vals[i] /= total_len;
++//
++//    // Compute normal at each point
++//    std::vector<ImVec2> normals(segments);
++//    for (int i = 0; i < segments; ++i) {
++//        ImVec2 d = outer[i] - inner[i];
++//        float len = sqrtf(d.x * d.x + d.y * d.y);
++//        normals[i] = (len > 0.0f) ? d / len : ImVec2(0, 0);
++//    }
++//
++//    // Bumped outer: always at least ribbon_width, with lump on top
++//    std::vector<ImVec2> bumped_outer = outer;
++//    for (int i = 0; i < segments; ++i) {
++//        float t = t_vals[i];
++//        float dt = fabsf(t - bump_center);
++//        if (dt > 0.5f) dt = 1.0f - dt;
++//        float bump = bump_amp * expf(-dt * dt * bump_sharp);
++//        // Always OUTWARD!
++//        bumped_outer[i] = inner[i] + normals[i] * (ribbon_width + bump);
++//    }
++//
++//    // Draw ribbon as quads
++//    for (int i = 0; i < segments; ++i)
++//    {
++//        int j = (i + 1) % segments;
++//        ImVec2 quad[4] = { inner[i], inner[j], bumped_outer[j], bumped_outer[i] };
++//
++//        // Color: brighter at the bump
++//        float t = t_vals[i];
++//        float dt = fabsf(t - bump_center); if (dt > 0.5f) dt = 1.0f - dt;
++//        float pulse = expf(-dt * dt * bump_sharp);
++//        ImU32 color = IM_COL32(100 + 120 * pulse, 220, 255, 160 + 80 * pulse);
++//
++//        drawList->AddConvexPolyFilled(quad, 4, color);
++//    }
++//}
++
++ImVec2 GetRoundedRectBorderPoint(const ImRect& rect, float radius, float t) {
++    // t in [0, 1)
++    float width = rect.Max.x - rect.Min.x;
++    float height = rect.Max.y - rect.Min.y;
++    float len0 = width - 2 * radius;      // Top
++    float len1 = height - 2 * radius;     // Right
++    float len2 = width - 2 * radius;      // Bottom
++    float len3 = height - 2 * radius;     // Left
++    float arc = IM_PI * 0.5f * radius;    // Each corner arc
++    float total = len0 + len1 + len2 + len3 + 4 * IM_PI * 0.5f * radius;
++
++    float d = t * total;
++    ImVec2 p;
++
++    // Top edge
++    if (d < len0) {
++        p = ImVec2(rect.Min.x + radius + d, rect.Min.y);
++    }
++    else if ((d -= len0) < arc) { // Top-right arc
++        float angle = -IM_PI * 0.5f + (d / arc) * IM_PI * 0.5f;
++        p = ImVec2(rect.Max.x - radius + radius * cosf(angle), rect.Min.y + radius + radius * sinf(angle));
++    }
++    else if ((d -= arc) < len1) { // Right edge
++        p = ImVec2(rect.Max.x, rect.Min.y + radius + d);
++    }
++    else if ((d -= len1) < arc) { // Bottom-right arc
++        float angle = 0 + (d / arc) * IM_PI * 0.5f;
++        p = ImVec2(rect.Max.x - radius + radius * cosf(angle), rect.Max.y - radius + radius * sinf(angle));
++    }
++    else if ((d -= arc) < len2) { // Bottom edge
++        p = ImVec2(rect.Max.x - radius - d, rect.Max.y);
++    }
++    else if ((d -= len2) < arc) { // Bottom-left arc
++        float angle = IM_PI * 0.5f + (d / arc) * IM_PI * 0.5f;
++        p = ImVec2(rect.Min.x + radius + radius * cosf(angle), rect.Max.y - radius + radius * sinf(angle));
++    }
++    else if ((d -= arc) < len3) { // Left edge
++        p = ImVec2(rect.Min.x, rect.Max.y - radius - d);
++    }
++    else { // Top-left arc
++        d -= len3;
++        float angle = IM_PI + (d / arc) * IM_PI * 0.5f;
++        p = ImVec2(rect.Min.x + radius + radius * cosf(angle), rect.Min.y + radius + radius * sinf(angle));
++    }
++    return p;
++}
++
++//void DrawCreatureRibbonBorder(
++//    ImDrawList* drawList,
++//    const ImRect& bounds,
++//    float rounding,
++//    float thickness = 3.0f,
++//    ImU32 color = IM_COL32(120, 220, 255, 220),
++//    int N = 100 // number of segments
++//) {
++//    // Step 1: Sample border points
++//    std::vector<ImVec2> border(N);
++//    for (int i = 0; i < N; ++i) {
++//        float t = (float)i / N;
++//        border[i] = GetRoundedRectBorderPoint(bounds, rounding, t);
++//    }
++//
++//    // Step 2: Compute normals
++//    std::vector<ImVec2> normals(N);
++//    for (int i = 0; i < N; ++i) {
++//        ImVec2 p0 = border[(i - 1 + N) % N];
++//        ImVec2 p1 = border[(i + 1) % N];
++//        ImVec2 tangent = ImVec2(p1.x - p0.x, p1.y - p0.y);
++//        float len = sqrtf(tangent.x * tangent.x + tangent.y * tangent.y);
++//        if (len > 1e-4f) tangent.x /= len, tangent.y /= len;
++//        normals[i] = ImVec2(-tangent.y, tangent.x);
++//    }
++//
++//    // Step 3: Animate bump + "creature" wobble
++//    float time = ImGui::GetTime();
++//    float bump_phase = fmodf(time * 0.25f, 1.0f); // Speed of bump
++//    std::vector<ImVec2> outer(N);
++//    for (int i = 0; i < N; ++i) {
++//        float t = (float)i / N;
++//
++//        // Bump (bulge) that travels the border
++//        float dt = fabsf(t - bump_phase);
++//        if (dt > 0.5f) dt = 1.0f - dt;
++//        float bump = 25.0f * powf(ImClamp(1.0f - dt * 6.0f, 0.0f, 1.0f), 3.0f);
++//
++//        // "Creature-like" wobble
++//        float wobble = 2*sinf(time * 2.2f + t * 11.0f) * 2.8f
++//            + cosf(time * 1.2f + t * 7.3f) * 1.2f;
++//
++//        float out_dist = thickness * 2.3f + bump + wobble;
++//
++//        outer[i] = border[i] + normals[i] * out_dist;
++//    }
++//
++//    // Step 4: Draw the glowing, breathing ribbon (multi-layer for glow)
++//    for (int layer = 2; layer >= 0; --layer) {
++//        float a = (layer == 0) ? 1.0f : 0.4f * (1.0f - layer / 3.0f);
++//        float width = (layer == 0) ? thickness : thickness + layer * 5.0f;
++//        ImU32 col = IM_COL32(
++//            120,
++//            220,
++//            255,
++//            int(150 * a)
++//        );
++//        for (int i = 0; i < N; ++i) {
++//            int j = (i + 1) % N;
++//            ImVec2 quad[4] = {
++//                border[i], border[j], outer[j], outer[i]
++//            };
++//            drawList->AddConvexPolyFilled(quad, 4, col);
++//        }
++//    }
++//
++//    // Step 5: Draw a crisp line on top for edge definition
++//    for (int i = 0; i < N; ++i) {
++//        int j = (i + 1) % N;
++//        drawList->AddLine(border[i], border[j], color, thickness);
++//    }
++//}
++
++//// looks nice but still wrong
++//void DrawCreatureRibbonBorderOutward(
++//    ImDrawList* drawList,
++//    const ImRect& bounds,
++//    float rounding,
++//    float thickness = 3.0f,
++//    ImU32 color = IM_COL32(120, 220, 255, 220),
++//    int N = 100 // number of segments
++//) {
++//    std::vector<ImVec2> border(N);
++//    for (int i = 0; i < N; ++i) {
++//        float t = (float)i / N;
++//        border[i] = GetRoundedRectBorderPoint(bounds, rounding, t);
++//    }
++//
++//    std::vector<ImVec2> normals(N);
++//    for (int i = 0; i < N; ++i) {
++//        ImVec2 p0 = border[(i - 1 + N) % N];
++//        ImVec2 p1 = border[(i + 1) % N];
++//        ImVec2 tangent = ImVec2(p1.x - p0.x, p1.y - p0.y);
++//        float len = sqrtf(tangent.x * tangent.x + tangent.y * tangent.y);
++//        if (len > 1e-4f) tangent.x /= len, tangent.y /= len;
++//        normals[i] = ImVec2(-tangent.y, tangent.x);
++//    }
++//
++//    float time = ImGui::GetTime();
++//    float bump_phase = fmodf(time * 0.25f, 1.0f);
++//
++//    // Outward offset for the whole ribbon:
++//    float ribbon_base_offset = thickness * 2.0f + 4.0f; // How far the ribbon is from the node border
++//
++//    std::vector<ImVec2> ribbon_inner(N);
++//    std::vector<ImVec2> ribbon_outer(N);
++//    for (int i = 0; i < N; ++i) {
++//        float t = (float)i / N;
++//        float dt = fabsf(t - bump_phase);
++//        if (dt > 0.5f) dt = 1.0f - dt;
++//        float bump = 14.0f * powf(ImClamp(1.0f - dt * 6.0f, 0.0f, 1.0f), 3.0f);
++//        float wobble = sinf(time * 2.2f + t * 11.0f) * 2.8f + cosf(time * 1.2f + t * 7.3f) * 1.2f;
++//        float ribbon_width = thickness * 2.0f + bump + wobble;
++//
++//        // Both inner and outer ribbon points are offset *outside* the node
++//        ribbon_inner[i] = border[i] + normals[i] * ribbon_base_offset;
++//        ribbon_outer[i] = border[i] + normals[i] * (ribbon_base_offset + ribbon_width);
++//    }
++//
++//    // Draw the ribbon layers
++//    for (int layer = 2; layer >= 0; --layer) {
++//        float a = (layer == 0) ? 1.0f : 0.4f * (1.0f - layer / 3.0f);
++//        float expand = layer * 5.0f;
++//        ImU32 col = IM_COL32(120, 220, 255, int(150 * a));
++//        for (int i = 0; i < N; ++i) {
++//            int j = (i + 1) % N;
++//            ImVec2 quad[4] = {
++//                ribbon_inner[i] + normals[i] * expand,
++//                ribbon_inner[j] + normals[j] * expand,
++//                ribbon_outer[j] + normals[j] * expand,
++//                ribbon_outer[i] + normals[i] * expand
++//            };
++//            drawList->AddConvexPolyFilled(quad, 4, col);
++//        }
++//    }
++//
++//    // Draw outline for definition (also offset outside)
++//    for (int i = 0; i < N; ++i) {
++//        int j = (i + 1) % N;
++//        drawList->AddLine(ribbon_inner[i], ribbon_inner[j], color, thickness * 0.85f);
++//    }
++//}
++void DrawCreatureRibbonBorderOutward(
++    ImDrawList* drawList,
++    const ImRect& bounds,
++    float rounding,
++    float thickness = 0.5f,
++    ImU32 color = IM_COL32(120, 220, 255, 220),
++    int N = 200 // number of segments
++) {
++    // Sample the perimeter of the ACTUAL node
++    std::vector<ImVec2> border(N);
++    for (int i = 0; i < N; ++i) {
++        float t = (float)i / N;
++        border[i] = GetRoundedRectBorderPoint(bounds, rounding, t);
++    }
++
++    // Outward normals
++    std::vector<ImVec2> normals(N);
++    for (int i = 0; i < N; ++i) {
++        ImVec2 p0 = border[(i - 1 + N) % N];
++        ImVec2 p1 = border[(i + 1) % N];
++        ImVec2 tangent = ImVec2(p1.x - p0.x, p1.y - p0.y);
++        float len = sqrtf(tangent.x * tangent.x + tangent.y * tangent.y);
++        if (len > 1e-4f) tangent.x /= len, tangent.y /= len;
++        normals[i] = -ImVec2(-tangent.y, tangent.x); // always outward for CCW traversal
++    }
++
++    float time = ImGui::GetTime();
++    float bump_phase = fmodf(time * 0.25f, 1.0f);
++
++    // For each border point, create the outward ribbon
++    float ribbon_width = thickness  + 0.5f;
++    std::vector<ImVec2> outer(N);
++    for (int i = 0; i < N; ++i) {
++        float t = (float)i / N;
++        float dt = fabsf(t - bump_phase);
++        if (dt > 0.5f) dt = 1.0f - dt;
++        float bump = 8.0f * powf(ImClamp(1.0f - dt * 6.0f, 0.0f, 1.0f), 4.0f)+2.0;
++        float wobble = sinf(time * 2.2f + t * 11.0f) * 2.8f + cosf(time * 1.2f + t * 7.3f) * 1.2f;
++        float out_dist = ribbon_width + bump + wobble;
++        // Only outwards!
++        outer[i] = border[i] + normals[i] * out_dist;
++    }
++
++    // Multi-layer glow
++    for (int layer = 2; layer >= 0; --layer) {
++        float a = (layer == 0) ? 1.0f : 0.4f * (1.0f - layer / 3.0f);
++        float expand = layer * 2.50f;
++        ImU32 col = IM_COL32(120, 220, 255, int(100 * a));
++        for (int i = 0; i < N; ++i) {
++            int j = (i + 1) % N;
++
++            ImU32 colx = IM_COL32(150 + 100 * cos(float(i) / N * 10 - time * 2.2f), 150, 150+150*sin(float(i)/N*5- time * 2.2f), int(100 * a));
++
++
++            ImVec2 quad[4] = {
++                border[i],
++                border[j],
++                outer[j] + normals[j] * expand,
++                outer[i] + normals[i] * expand
++            };
++            drawList->AddConvexPolyFilled(quad, 4, colx);
++        }
++    }
++
++    // Optional: draw a border line exactly at the node edge for crispness
++    for (int i = 0; i < N; ++i) {
++        int j = (i + 1) % N;
++        drawList->AddLine(border[i], border[j], color, thickness);
++    }
++}
++
++
++
++void ed::Node::DrawBorder(ImDrawList* drawList, ImU32 color, float thickness, float offset, bool special)
++{
++    // --- Main border on top ---
++    if (thickness > 0.0f) {
++
+         const ImVec2 extraOffset = ImVec2(offset, offset);
+-
+-        drawList->AddRect(m_Bounds.Min - extraOffset, m_Bounds.Max + extraOffset,
+-            color, ImMax(0.0f, m_Rounding + offset), c_AllRoundCornersFlags, thickness);
+-    }
+-}
++        float pulse = 0.65f + 0.25f * sin(ImGui::GetTime() * 2 + float(m_ID.Get()) * 0.73f);
++        float round = ImMax(0.0f, m_Rounding + offset);
++
++        ImVec2 min = m_Bounds.Min - extraOffset;
++        ImVec2 max = m_Bounds.Max + extraOffset;
++
++        // --- Feathered glow ---
++        const int feather_layers = 10;
++        const float feather_width = 11.0f;
++        const float base_thickness = thickness * 0.5f * pulse;
++        for (int i = feather_layers - 1; i >= 0; --i) {
++            float t = (float)i / (float)feather_layers;
++            float layer_thickness = base_thickness + t * feather_width;
++            int alpha = int(74 * (1.0f - t) * pulse);
++            ImU32 glow_color = IM_COL32(120, 220, 255, alpha);
++            float layer_round = round + t * 7.0f;
++            ImVec2 d = ImVec2(layer_thickness * 0.5f, layer_thickness * 0.5f);
++            drawList->AddRect(min - d, max + d, glow_color, layer_round, c_AllRoundCornersFlags, layer_thickness);
++        }
++
++        drawList->AddRect(min, max, color, round, c_AllRoundCornersFlags, thickness);
++
++
++        if ( traits & VisualTrait::Ribbon)
++        {
++            ImRect bounds = ImRect(m_Bounds.Min, m_Bounds.Max);
++            DrawCreatureRibbonBorderOutward(drawList, bounds, m_Rounding + offset, thickness);
++        }
++
++    }
++}
++
++
++
+ 
+ void ed::Node::GetGroupedNodes(std::vector<Node*>& result, bool append)
+ {
+@@ -891,15 +1204,14 @@
+ 
+         drawList->ChannelsSetCurrent(c_LinkChannel_Selection);
+ 
+-        Draw(drawList, borderColor, 4.5f);
++        Draw(drawList, borderColor, 11.0f);
+     }
+     else if (flags & Hovered)
+     {
+         const auto borderColor = Editor->GetColor(StyleColor_HovLinkBorder);
+ 
+         drawList->ChannelsSetCurrent(c_LinkChannel_Selection);
+-
+-        Draw(drawList, borderColor, 2.0f);
++        Draw(drawList, borderColor, 9.5f);
+     }
+     else if (flags & Highlighted)
+     {
+@@ -908,22 +1220,218 @@
+         Draw(drawList, m_HighlightColor, 3.5f);
+     }
+ }
++
++
++ImVec2 BezierPoint(const ImCubicBezierPoints& c, float t) {
++    float u = 1.0f - t;
++    float tt = t * t;
++    float uu = u * u;
++    float uuu = uu * u;
++    float ttt = tt * t;
++
++    ImVec2 p = c.P0 * uuu;        // (1-t)^3 * P0
++    p += c.P1 * 3 * uu * t;       // 3(1-t)^2 * t * P1
++    p += c.P2 * 3 * u * tt;       // 3(1-t) * t^2 * P2
++    p += c.P3 * ttt;              // t^3 * P3
++    return p;
++}
++
++
++
++
++
++//------------------------------------------------------------------------------
++/////////////// NOTE ///////////////////////////////////////////////////////////
++// not using this, using a more advanced one
++// this one is not working properly (Bowtie)
++//------------------------------------------------------------------------------
++void DrawTaperedBezier(ImDrawList* drawList, const ImCubicBezierPoints& curve,
++    float widthStart, float widthEnd, ImU32 color)
++{
++    const int segments = 48; // Higher = smoother
++    std::vector<ImVec2> left, right;
++
++    for (int i = 0; i < segments; ++i)
++    {
++        float t = float(i) / (segments - 1);
++        ImVec2 pt = BezierPoint(curve, t);
++
++        // Compute direction (finite difference)
++        float delta = 1.0f / (segments - 1);
++        float t0 = ImClamp(t - delta, 0.0f, 1.0f);
++        float t1 = ImClamp(t + delta, 0.0f, 1.0f);
++        ImVec2 dir = BezierPoint(curve, t1) - BezierPoint(curve, t0);
++        float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
++        if (len == 0) dir = ImVec2(1, 0); // Fallback
++        else          dir /= len;
++
++        // Normal direction (flip sign if shape is inside-out)
++        ImVec2 normal = ImVec2(dir.y, -dir.x);
++
++        float w = widthStart * (1.0f - t) + widthEnd * t;
++        left.push_back(pt - normal * (w * 0.2f));
++        right.push_back(pt + normal * (w * 0.2f));
++
++        drawList->AddPolyline(left.data(), left.size(), IM_COL32(200, 200, 200, 200), false, 1.0f);
++        drawList->AddPolyline(right.data(), right.size(), IM_COL32(200, 200, 200, 200), false, 1.0f);
++
++    }
++
++    for (int i = 0; i < segments - 1; ++i)
++    {
++        ImVec2 quad[4] = {
++            left[i],
++            left[i + 1],
++            right[i + 1],
++            right[i]
++        };
++        drawList->AddConvexPolyFilled(quad, 4, color); // 4 points = quad (always convex)
++    }
++}
++
++//------------------------------------------------------------------------------
++/////////////// PULSING RUBBON /////////////// 
++// The one actually in use.
++// Pulsing ribbon
++//------------------------------------------------------------------------------
++
++void DrawTaperedBezierWithPulse(ImDrawList* drawList, const ImCubicBezierPoints& curve,
++    float startWidth, float endWidth, ImU32 baseColor, float pulseSpeed, float phase)
++{
++    const int segments = 48;
++    std::vector<ImVec2> left, right;
++
++    // Pulse center t (moves along the ribbon)
++    float time = ImGui::GetTime();
++    float pulsePos = fmod(time * pulseSpeed + phase, 1.0f);
++
++    for (int i = 0; i < segments; ++i)
++    {
++        float t = float(i) / (segments - 1);
++        ImVec2 pt = BezierPoint(curve, t);
++
++        // Forward difference for direction (prevents flip)
++        ImVec2 dir;
++        if (i < segments - 1)
++            dir = BezierPoint(curve, float(i + 1) / (segments - 1)) - pt;
++        else
++            dir = pt - BezierPoint(curve, float(i - 1) / (segments - 1));
++        float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
++        dir = (len > 0.0f) ? dir / len : ImVec2(1, 0);
++        ImVec2 normal = ImVec2(-dir.y, dir.x);
++
++        // --- Pulse effect (Gaussian envelope) ---
++        float pulseDist = fabsf(t - pulsePos);
++        // Loop around if crossing boundary
++        if (pulseDist > 0.5f) pulseDist = 1.0f - pulseDist;
++        float pulse = expf(-pulseDist * pulseDist * 48.0f); // controls sharpness
++
++        float width = (startWidth * (1.0f - t) + endWidth * t) * (1.0f + 0.6f * pulse);
++        left.push_back(pt - normal * (width * 0.5f));
++        right.push_back(pt + normal * (width * 0.5f));
++    }
++
++    // Draw quad segments with color pulse
++    for (int i = 0; i < segments - 1; ++i)
++    {
++        float t0 = float(i) / (segments - 1);
++        float t1 = float(i + 1) / (segments - 1);
++
++        // Pulse for color
++        float pulseDist0 = fabsf(t0 - pulsePos);
++        float pulseDist1 = fabsf(t1 - pulsePos);
++        if (pulseDist0 > 0.5f) pulseDist0 = 1.0f - pulseDist0;
++        if (pulseDist1 > 0.5f) pulseDist1 = 1.0f - pulseDist1;
++        float colorPulse0 = expf(-pulseDist0 * pulseDist0 * 42.0f);
++        float colorPulse1 = expf(-pulseDist1 * pulseDist1 * 42.0f);
++
++        // Build color pulse: baseColor plus white/blue highlight
++        ImVec4 cBase = ImGui::ColorConvertU32ToFloat4(baseColor);
++        ImVec4 cPulse0 = cBase;
++        cPulse0.x = ImMin(1.0f, cBase.x + 0.4f * colorPulse0);
++        cPulse0.y = ImMin(1.0f, cBase.y + 0.4f * colorPulse0);
++        cPulse0.z = ImMin(1.0f, cBase.z + 0.7f * colorPulse0);
++        cPulse0.w = ImMin(1.0f, cBase.w + 0.5f * colorPulse0);
++
++        ImU32 segColor = ImGui::ColorConvertFloat4ToU32(cPulse0);
++
++        // Draw ribbon segment
++        ImVec2 quad[4] = { left[i], left[i + 1], right[i + 1], right[i] };
++        drawList->AddConvexPolyFilled(quad, 4, segColor);
++    }
++
++    // Optionally: Draw left/right outlines for debugging
++     drawList->AddPolyline(left.data(), left.size(), IM_COL32(0,60,240,150), false, 0.5f);
++     drawList->AddPolyline(right.data(), right.size(), IM_COL32(255,0,0,100), false, 0.2f);
++}
++
+ 
+ void ed::Link::Draw(ImDrawList* drawList, ImU32 color, float extraThickness) const
+ {
+     if (!m_IsLive)
+         return;
+ 
+-    const auto curve = GetCurve();
+-
+-    ImDrawList_AddBezierWithArrows(drawList, curve, m_Thickness + extraThickness,
+-        m_StartPin && m_StartPin->m_ArrowSize  > 0.0f ? m_StartPin->m_ArrowSize  + extraThickness : 0.0f,
+-        m_StartPin && m_StartPin->m_ArrowWidth > 0.0f ? m_StartPin->m_ArrowWidth + extraThickness : 0.0f,
+-          m_EndPin &&   m_EndPin->m_ArrowSize  > 0.0f ?   m_EndPin->m_ArrowSize  + extraThickness : 0.0f,
+-          m_EndPin &&   m_EndPin->m_ArrowWidth > 0.0f ?   m_EndPin->m_ArrowWidth + extraThickness : 0.0f,
+-        true, color, 1.0f,
+-        m_StartPin && m_StartPin->m_SnapLinkToDir ? &m_StartPin->m_Dir : nullptr,
+-        m_EndPin   &&   m_EndPin->m_SnapLinkToDir ?   &m_EndPin->m_Dir : nullptr);
++        const auto curve = GetCurve();
++        ImDrawList_AddBezierWithArrows(drawList, curve, m_Thickness + extraThickness,
++            m_StartPin && m_StartPin->m_ArrowSize > 0.0f ? m_StartPin->m_ArrowSize + extraThickness : 0.0f,
++            m_StartPin && m_StartPin->m_ArrowWidth > 0.0f ? m_StartPin->m_ArrowWidth + extraThickness : 0.0f,
++            m_EndPin && m_EndPin->m_ArrowSize > 0.0f ? m_EndPin->m_ArrowSize + extraThickness : 0.0f,
++            m_EndPin && m_EndPin->m_ArrowWidth > 0.0f ? m_EndPin->m_ArrowWidth + extraThickness : 0.0f,
++            true, color, 1.0f,
++            m_StartPin && m_StartPin->m_SnapLinkToDir ? &m_StartPin->m_Dir : nullptr,
++            m_EndPin && m_EndPin->m_SnapLinkToDir ? &m_EndPin->m_Dir : nullptr);
++
++
++        if (m_StartPin && m_StartPin->m_Node || m_EndPin && m_EndPin->m_Node)
++        {
++
++            auto color3 = IM_COL32(240, 100, 20, 200);
++            auto color2 = IM_COL32(240, 200, 60, 180);
++            color = IM_COL32(100, 150, 255, 180);
++
++            float startWidth = 10.0f; // thick at start
++            float endWidth = 4.0f;  // thin at end
++
++            // Animate t along the curve
++            // Animate t along the curve
++            float speed = 0.6f;
++            float phase = float(m_ID.Get()) * 0.21f;
++            float time = ImGui::GetTime();
++            float t = fmod(time * speed + phase, 1.0f);
++
++
++            // Using animated ribbon
++            DrawTaperedBezierWithPulse(drawList, curve,
++                startWidth, endWidth, color, speed, phase);
++
++            // Animate size and glow for energy effect
++            float flicker = 1.0f + 0.18f * sin(time * 8.3f + phase);
++            float glowPulse = 1.0f + 0.10f * cos(time * 4.1f + phase * 2.3f);
++
++            // Use the main link color as base for blending
++            ImU32 baseColor = color3; // your input "color"
++            ImVec4 base = ImGui::ColorConvertU32ToFloat4(baseColor);
++
++            ImU32 coreColor = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, 0.82f));
++            ImU32 glow1 = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, 0.25f));
++            ImU32 glow2 = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, 0.08f));
++            ImU32 glow3 = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, 0.02f));
++
++            // Optionally, a bit of hot color at the center for pop:
++            ImU32 centerHot = IM_COL32(250, 190, 50, 200);
++
++            ImVec2 orbPos = BezierPoint(curve, t);
++            float orbRadius = 4.0f * flicker;
++
++            // Glows: bigger, more transparent
++            drawList->AddCircleFilled(orbPos, orbRadius * 2.5f * glowPulse, glow3);
++            drawList->AddCircleFilled(orbPos, orbRadius * 1.6f * glowPulse, glow2);
++            drawList->AddCircleFilled(orbPos, orbRadius * 1.1f * glowPulse, glow1);
++
++            // Core and center highlight
++            drawList->AddCircleFilled(orbPos, orbRadius, coreColor);
++            drawList->AddCircleFilled(orbPos, orbRadius * 0.42f, centerHot);
++        }
+ }
+ 
+ void ed::Link::UpdateEndpoints()
+@@ -933,13 +1441,52 @@
+     m_End   = line.B;
+ }
+ 
++
+ ImCubicBezierPoints ed::Link::GetCurve() const
+ {
++    // Detect self-loop: start and end pins are on the same node
++    bool isSelfLoop = m_StartPin && m_EndPin &&
++        (m_StartPin->m_Node == m_EndPin->m_Node);
++
++    if (isSelfLoop)
++    {
++        ImVec2 start = m_Start;
++        ImVec2 end = m_End;
++
++        ImRect nodeRect = m_StartPin->m_Node->GetBounds();
++        ImVec2 nodeCenter = (nodeRect.Min + nodeRect.Max) * 0.5f;
++        ImVec2 nodeSize = nodeRect.GetSize();
++
++        // Control the "width" and "height" of the loop
++        float loopRadiusX = nodeSize.x * 1.8f; // try 0.8–1.2 for different effects
++        float loopRadiusY = nodeSize.x * 1.8f; // try 0.5–1.0
++
++        ImVec2 up = ImVec2(0, -loopRadiusY); // up in y
++        ImVec2 left = ImVec2(-loopRadiusX * 0.5f, 0);
++        ImVec2 right = ImVec2(loopRadiusX * 0.5f, 0);
++
++        // Control points are "up and left" and "up and right" from the node center
++        ImVec2 ofst = end - start;
++        ImVec2 ofst_trans(ofst.y, ofst.x);
++        ofst_trans.y = 0;
++        ImVec2 ctrl1 = nodeCenter + left + up - ofst_trans*2;
++        ImVec2 ctrl2 = nodeCenter + right + up - ofst_trans*2;
++
++        ImCubicBezierPoints result;
++        result.P0 = start;
++        result.P1 = ctrl1;
++        result.P2 = ctrl2;
++        result.P3 = end;
++        return result;
++    }
++
++
++    // Normal link: use your existing logic
+     auto easeLinkStrength = [](const ImVec2& a, const ImVec2& b, float strength)
+     {
+-        const auto distanceX    = b.x - a.x;
+-        const auto distanceY    = b.y - a.y;
+-        const auto distance     = ImSqrt(distanceX * distanceX + distanceY * distanceY);
++        const auto distanceX = b.x - a.x;
++        const auto distanceY = b.y - a.y;
++        const auto distance = ImSqrt(distanceX * distanceX + distanceY * distanceY);
+         const auto halfDistance = distance * 0.5f;
+ 
+         if (halfDistance < strength)
+@@ -949,9 +1496,9 @@
+     };
+ 
+     const auto startStrength = easeLinkStrength(m_Start, m_End, m_StartPin->m_Strength);
+-    const auto   endStrength = easeLinkStrength(m_Start, m_End,   m_EndPin->m_Strength);
++    const auto   endStrength = easeLinkStrength(m_Start, m_End, m_EndPin->m_Strength);
+     const auto           cp0 = m_Start + m_StartPin->m_Dir * startStrength;
+-    const auto           cp1 =   m_End +   m_EndPin->m_Dir *   endStrength;
++    const auto           cp1 = m_End + m_EndPin->m_Dir * endStrength;
+ 
+     ImCubicBezierPoints result;
+     result.P0 = m_Start;
+@@ -961,6 +1508,8 @@
+ 
+     return result;
+ }
++
++
+ 
+ bool ed::Link::TestHit(const ImVec2& point, float extraThickness) const
+ {
+@@ -1058,8 +1607,6 @@
+     else
+         return ImRect();
+ }
+-
+-
+ 
+ 
+ //------------------------------------------------------------------------------
+@@ -1188,15 +1735,7 @@
+     auto previousVisibleRect = m_Canvas.ViewRect();
+     m_IsCanvasVisible = m_Canvas.Begin(id, canvasSize);
+ 
+-    //ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+-    //ImGui::BeginChild(id, size, false,
+-    //    ImGuiWindowFlags_NoMove |
+-    //    ImGuiWindowFlags_NoScrollbar |
+-    //    ImGuiWindowFlags_NoScrollWithMouse);
+-
+     m_IsFocused = ImGui::IsWindowFocused();
+-
+-    //
+     m_NavigateAction.SetWindow(m_Canvas.ViewRect().Min, m_Canvas.ViewRect().GetSize());
+ 
+     // Handle canvas size change. Scale to Y axis, center on X.
+@@ -1390,7 +1929,7 @@
+     {
+         if (!IsGroup(control.ActiveNode))
+         {
+-            // Bring active node to front
++            // Bring working node to front
+             auto activeNodeIt = std::find(m_Nodes.begin(), m_Nodes.end(), control.ActiveNode);
+             std::rotate(activeNodeIt, activeNodeIt + 1, m_Nodes.end());
+         }
+@@ -2525,7 +3064,7 @@
+     // Process link input using background interactions.
+     auto hotLink = hotObject ? hotObject->AsLink() : nullptr;
+ 
+-    // ImGui take care of tracking active items. With link
++    // ImGui take care of tracking working items. With link
+     // we must do this ourself.
+     if (!isDragging && isBackgroundActive && hotLink && !m_LastActiveLink)
+         m_LastActiveLink = hotLink;
+@@ -4397,7 +4936,7 @@
+         candidateAction = Copy;
+     if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_V))
+         candidateAction = Paste;
+-    if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_D))
++    if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(GetKeyIndexForD()))
+         candidateAction = Duplicate;
+     if (!io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_Space))
+         candidateAction = CreateNode;
+@@ -4410,6 +4949,7 @@
+             if (!selection.empty())
+             {
+                 // #TODO: Find a way to simplify logic.
++
+                 m_Context.assign(selection.begin(), selection.end());
+ 
+                 // Expand groups
+@@ -5005,8 +5545,8 @@
+     //    else return "";
+     //};
+ 
+-    ImGui::Text("%s:", GetName());
+-    ImGui::Text("    Active: %s", m_IsActive ? "yes" : "no");
++//    ImGui::Text("%s:", GetName());
++//    ImGui::Text("    Active: %s", m_IsActive ? "yes" : "no");
+     //ImGui::Text("    Node: %s (%d)", getObjectName(DeleteItemsgedNode), DeleteItemsgedNode ? DeleteItemsgedNode->ID : 0);
+ }
+ 
+@@ -5199,7 +5739,7 @@
+     m_PinSplitter.ClearFreeMemory();
+ }
+ 
+-void ed::NodeBuilder::Begin(NodeId nodeId)
++void ed::NodeBuilder::Begin(NodeId nodeId, uint32_t traits)
+ {
+     IM_ASSERT(nullptr == m_CurrentNode);
+ 
+@@ -5244,6 +5784,11 @@
+     auto& editorStyle = Editor->GetStyle();
+ 
+     const auto alpha = ImGui::GetStyle().Alpha;
++
++
++    // NEW
++    // passing traits
++    m_CurrentNode->traits = traits;
+ 
+     m_CurrentNode->m_IsLive           = true;
+     m_CurrentNode->m_LastPin          = nullptr;

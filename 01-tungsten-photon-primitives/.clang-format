@@ -1,0 +1,17 @@
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++11
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 110
+BreakBeforeBraces: Allman
+NamespaceIndentation: All
+SortIncludes: Never
+IncludeBlocks: Preserve
+ReflowComments: Never
+BreakStringLiterals: false
+FixNamespaceComments: false
+SkipMacroDefinitionBody: true
+AllowShortFunctionsOnASingleLine: Empty
+MaxEmptyLinesToKeep: 1

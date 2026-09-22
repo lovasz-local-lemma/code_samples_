@@ -1,0 +1,880 @@
+#version 450 core
+
+// SPH force + integrate + CCD collision + XSPH smoothing
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer PositionBuffer   { vec2  positions[];   };
+layout(std430, binding = 1) buffer VelocityBuffer   { vec2  velocities[];  };
+layout(std430, binding = 2) readonly buffer MassBuffer     { float masses[];     };
+layout(std430, binding = 3) readonly buffer DensityBuffer   { float densities[];  };
+layout(std430, binding = 6) buffer TempBuffer { float temperatures[]; };
+layout(std430, binding = 7) readonly buffer MatIDBuffer { uint material_ids[]; };
+layout(std430, binding = 9) buffer ColorBuffer    { vec4  colors[];     };
+layout(std430, binding = 10) buffer ThermalStateBuffer { float thermal_state[]; };
+layout(std430, binding = 12) readonly buffer SortedIndexBuf { uint  sorted_indices[]; };
+layout(std430, binding = 13) readonly buffer CellStartBuf   { uint  cell_start[];    };
+layout(std430, binding = 14) readonly buffer CellEndBuf     { uint  cell_end[];      };
+
+// Codimensional data for visualization
+layout(std430, binding = 16) readonly buffer CodimBuf { vec4 codim_data_vis[]; };
+layout(std430, binding = 17) readonly buffer SpringAnchorBuf { vec2 spring_anchor[]; };
+layout(std430, binding = 18) readonly buffer SpringWeightBuf { float spring_weight[]; };
+layout(std430, binding = 55) readonly buffer MaterialParamBuf { vec4 material_params[]; };
+layout(std430, binding = 40) readonly buffer MPMGridMass { int mpm_grid_mass[]; };
+// NOTE: this shader is at the GPU's max-SSBO-blocks limit (C5058 if two more
+// are added), so the contact-heat SPH consume lives in sph_contact_mix.comp.
+
+layout(binding = 0) uniform sampler2D u_sdf_tex;
+layout(binding = 1) uniform sampler2D u_air_temp_tex;
+
+uniform uint  u_offset;
+uniform uint  u_count;
+uniform float u_h;
+uniform float u_rest_density;
+uniform float u_gas_constant;
+uniform float u_viscosity;
+uniform float u_xsph;          // XSPH smoothing factor (0.0-0.5)
+uniform float u_dt;
+uniform vec2  u_gravity;
+uniform uint  u_table_size;
+uniform float u_cell_size;
+uniform vec2  u_world_min;
+
+uniform vec2  u_sdf_world_min;
+uniform vec2  u_sdf_world_max;
+uniform int   u_use_sdf;
+
+uniform vec2  u_bound_min;
+uniform vec2  u_bound_max;
+
+uniform vec2  u_mouse_world;
+uniform float u_mouse_radius;
+uniform float u_mouse_inner_radius;
+uniform float u_mouse_force;
+uniform vec2  u_mouse_dir;
+uniform float u_mouse_damping;
+uniform int   u_mouse_mode;
+uniform vec2  u_spring_origin;
+
+uniform int   u_vis_mode;
+uniform int   u_keep_colors;
+uniform uint  u_highlight_start;
+uniform uint  u_highlight_end;
+uniform float u_surface_tension; // CSF surface tension coefficient
+uniform int   u_enable_interfaces;
+uniform float u_interface_repulsion;
+uniform float u_interface_tension;
+uniform float u_cross_mix;
+uniform float u_cross_thermal_mix;
+uniform float u_mpm_contact_push;
+uniform float u_mpm_contact_damping;
+uniform float u_mpm_contact_recovery;
+uniform int   u_enable_thermal;
+uniform int   u_ordinary_water_boiling;
+uniform float u_ambient_temp;
+uniform vec2  u_heat_pos;
+uniform float u_heat_radius;
+uniform float u_heat_temp;
+uniform vec2  u_heat_gun_pos;
+uniform float u_heat_gun_radius;
+uniform float u_heat_gun_power;
+uniform float u_particle_cooling;
+uniform float u_time;
+uniform int   u_use_mpm_coupling;
+// Coupling v2. 0 = legacy one-way penalty, 1 = passive response:
+// restitution <= 1 plus dt-based recovery.
+uniform int   u_coupling_v2;
+uniform int   u_full_contact_reaction; // opt-in: all local contact impulse, at the sampled position
+uniform float u_mpm_restitution;   // e in [0,1]; k = 1+e, so never over-unity
+uniform float u_mpm_recover_rate;  // 1/s; 120 matches the legacy per-frame magnitude
+// Momentum coupling: the equal-and-opposite reaction this SPH particle applies
+// BACK to the MPM material, recorded here and scattered to the MPM grid by
+// sph_mpm_reaction.comp. Written as an IMAGE, not an SSBO: image uniforms are
+// a separate binding namespace, so this shader (at exactly 16 std430 blocks, the
+// driver cap) can still emit it. Recording it here -- at the one site where the
+// contact force is actually known -- avoids duplicating the contact logic in the
+// scatter pass, which would be free to drift out of sync.
+uniform int   u_emit_reaction;
+layout(binding = 0, rgba32f) uniform coherent restrict imageBuffer u_sph_reaction;
+uniform vec2  u_mpm_grid_origin;
+uniform ivec2 u_mpm_grid_res;
+uniform float u_mpm_dx;
+uniform int   u_use_air_heat;
+uniform vec2  u_air_world_min;
+uniform vec2  u_air_world_max;
+
+#include "common/sph_kernels.glsl"
+
+#define MAT_SPH_WATER 50u
+#define MAT_SPH_VISCOUS_GOO 51u
+#define MAT_SPH_LIGHT_OIL 52u
+#define MAT_SPH_BURNING_OIL 53u
+#define MAT_SPH_BOILING_WATER 54u
+#define MAT_SPH_THERMAL_SYRUP 55u
+#define MAT_SPH_FLASH_FLUID 56u
+
+const float INV_FIXED_SCALE = 1.0 / 1000000.0;
+
+bool is_boiling_water(uint mat) {
+    return mat == MAT_SPH_BOILING_WATER ||
+           (u_ordinary_water_boiling == 1 && mat == MAT_SPH_WATER);
+}
+
+// --- EOS: zero-clamp negative pressure (no tensile instability) ---
+float eos_pressure(float rho, float rho0, float k) {
+    return k * max(rho - rho0, 0.0);
+}
+
+float heat_falloff(vec2 pos, vec2 center, float radius) {
+    if (radius <= 1e-5) return 0.0;
+    float d = length(pos - center);
+    if (d >= radius) return 0.0;
+    float t = 1.0 - d / radius;
+    return t * t;
+}
+
+float sample_air_temp(vec2 pos) {
+    if (u_use_air_heat == 0) return u_ambient_temp;
+    vec2 uv = (pos - u_air_world_min) / (u_air_world_max - u_air_world_min);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return u_ambient_temp;
+    return texture(u_air_temp_tex, uv).r;
+}
+
+bool is_aqueous(uint mat) {
+    return mat == MAT_SPH_WATER ||
+           mat == MAT_SPH_BOILING_WATER ||
+           mat == MAT_SPH_THERMAL_SYRUP ||
+           mat == MAT_SPH_VISCOUS_GOO;
+}
+
+bool is_oily(uint mat) {
+    return mat == MAT_SPH_LIGHT_OIL ||
+           mat == MAT_SPH_BURNING_OIL;
+}
+
+bool is_volatile(uint mat) {
+    return mat == MAT_SPH_FLASH_FLUID;
+}
+
+float immiscibility_pair(uint a, uint b) {
+    if (a == b) return 0.0;
+    if ((is_aqueous(a) && is_oily(b)) || (is_oily(a) && is_aqueous(b))) return 1.0;
+    if ((is_aqueous(a) && is_volatile(b)) || (is_volatile(a) && is_aqueous(b))) return 0.65;
+    if ((is_oily(a) && is_volatile(b)) || (is_volatile(a) && is_oily(b))) return 0.35;
+    return 0.0;
+}
+
+void fluid_props(uint mat, vec4 mat_param, float temp, float state,
+                 out float rho0, out float gas_k, out float visc,
+                 out float surface_scale, out float thermal_buoy, out float glow) {
+    rho0 = u_rest_density;
+    gas_k = (mat_param.x > 0.0) ? mat_param.x : u_gas_constant;
+    visc = (mat_param.y > 0.0) ? mat_param.y : u_viscosity;
+    surface_scale = (mat_param.z > 0.0) ? mat_param.z : 1.0;
+    thermal_buoy = 0.0;
+    glow = clamp((temp - u_ambient_temp) / 500.0, 0.0, 1.0);
+
+    if (mat == MAT_SPH_VISCOUS_GOO) {
+        rho0 *= 1.08;
+        gas_k *= 0.82;
+        visc = mix(visc * 1.20, 0.18, clamp((temp - 330.0) / 200.0, 0.0, 1.0));
+        surface_scale *= 1.18;
+    } else if (mat == MAT_SPH_LIGHT_OIL) {
+        rho0 *= 0.88;
+        gas_k *= 0.92;
+        visc = mix(visc, max(visc * 0.45, 0.008), clamp((temp - 320.0) / 220.0, 0.0, 1.0));
+        surface_scale *= 0.82;
+    } else if (mat == MAT_SPH_BURNING_OIL) {
+        rho0 *= 0.84;
+        gas_k *= mix(0.94, 0.82, state);
+        visc = mix(max(visc * 0.95, 0.014), 0.018, state);
+        surface_scale *= mix(0.86, 0.58, state);
+        thermal_buoy = state * 8.0;
+        glow = max(glow, clamp(0.18 + state, 0.0, 1.0));
+    } else if (is_boiling_water(mat)) {
+        gas_k *= mix(1.00, 0.90, state);
+        visc = mix(visc, max(visc * 0.36, 0.020), state);
+        surface_scale *= mix(1.10, 0.72, state);
+        thermal_buoy = state * 4.8;
+        glow = max(glow, state * 0.72);
+    } else if (mat == MAT_SPH_THERMAL_SYRUP) {
+        rho0 *= 1.14;
+        gas_k *= mix(1.12, 0.84, state);
+        visc = mix(visc * 1.9, 0.050, state);
+        surface_scale *= mix(1.35, 0.88, state);
+        glow = max(glow, state * 0.45);
+    } else if (mat == MAT_SPH_FLASH_FLUID) {
+        rho0 *= 0.74;
+        gas_k *= mix(0.78, 0.46, state);
+        visc = mix(max(visc * 0.70, 0.006), 0.010, state);
+        surface_scale *= mix(0.64, 0.22, state);
+        thermal_buoy = state * 8.0;
+        glow = max(glow, state * 0.82);
+    }
+}
+
+vec3 fluid_base_color(uint mat, float hot, float state, float rho_ratio) {
+    if (mat == MAT_SPH_VISCOUS_GOO) {
+        return mix(vec3(0.22, 0.62, 0.18), vec3(0.84, 0.78, 0.18), hot * 0.55);
+    }
+    if (mat == MAT_SPH_LIGHT_OIL) {
+        return mix(vec3(0.54, 0.46, 0.14), vec3(0.88, 0.62, 0.14), hot * 0.45);
+    }
+    if (mat == MAT_SPH_BURNING_OIL) {
+        return mix(vec3(0.26, 0.16, 0.06), vec3(1.0, 0.42, 0.08), clamp(state * 0.9 + hot * 0.4, 0.0, 1.0));
+    }
+    if (is_boiling_water(mat)) {
+        return mix(vec3(0.34, 0.58, 0.94), vec3(0.92, 0.94, 1.0), state * 0.75);
+    }
+    if (mat == MAT_SPH_THERMAL_SYRUP) {
+        return mix(vec3(0.44, 0.22, 0.08), vec3(0.92, 0.56, 0.18), clamp(state * 0.85 + hot * 0.2, 0.0, 1.0));
+    }
+    if (mat == MAT_SPH_FLASH_FLUID) {
+        return mix(vec3(0.62, 0.56, 0.42), vec3(1.0, 0.82, 0.54), clamp(state * 0.9 + hot * 0.25, 0.0, 1.0));
+    }
+    float depth = clamp((1.0 - rho_ratio) * 0.6 + 0.5, 0.0, 1.0);
+    return vec3(0.1 + 0.15 * depth + hot * 0.05,
+                0.3 + 0.15 * depth,
+                0.6 + 0.3 * (1.0 - depth) + hot * 0.08);
+}
+
+// --- SDF queries ---
+float query_sdf(vec2 wp) {
+    vec2 uv = (wp - u_sdf_world_min) / (u_sdf_world_max - u_sdf_world_min);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return -0.01;
+    return texture(u_sdf_tex, uv).r;
+}
+
+vec2 sdf_normal(vec2 wp) {
+    vec2 eps = (u_sdf_world_max - u_sdf_world_min) / vec2(textureSize(u_sdf_tex, 0));
+    float dx = query_sdf(wp + vec2(eps.x, 0)) - query_sdf(wp - vec2(eps.x, 0));
+    float dy = query_sdf(wp + vec2(0, eps.y)) - query_sdf(wp - vec2(0, eps.y));
+    vec2 g = vec2(dx, dy);
+    float len = length(g);
+    return len > 1e-6 ? g / len : vec2(0.0, 1.0);
+}
+
+float sample_sdf_contact_temp(vec2 pos, out float contact_w) {
+    contact_w = 0.0;
+    if (u_use_sdf == 0 || u_use_air_heat == 0) return u_ambient_temp;
+    float sdf_d = query_sdf(pos);
+    if (sdf_d < 0.0) {
+        contact_w = 1.0;
+        return sample_air_temp(pos);
+    }
+    ivec2 air_res = textureSize(u_air_temp_tex, 0);
+    vec2 air_cell = (u_air_world_max - u_air_world_min) / vec2(max(air_res, ivec2(1)));
+    float probe = max(max(air_cell.x, air_cell.y) * 1.6, 0.02);
+    if (sdf_d > probe * 1.4) return u_ambient_temp;
+    vec2 n = sdf_normal(pos);
+    vec2 inside = pos - n * (sdf_d + probe);
+    contact_w = 1.0 - clamp(sdf_d / max(probe * 1.4, 1e-5), 0.0, 1.0);
+    return sample_air_temp(inside);
+}
+
+// --- Color helpers ---
+vec3 viridis(float t) {
+    t = clamp(t, 0.0, 1.0);
+    vec3 c0 = vec3(0.267, 0.004, 0.329);
+    vec3 c1 = vec3(0.282, 0.141, 0.457);
+    vec3 c2 = vec3(0.254, 0.265, 0.529);
+    vec3 c3 = vec3(0.163, 0.471, 0.558);
+    vec3 c4 = vec3(0.134, 0.658, 0.517);
+    vec3 c5 = vec3(0.477, 0.821, 0.318);
+    vec3 c6 = vec3(0.993, 0.906, 0.144);
+    float s = t * 6.0;
+    int seg = int(floor(s));
+    float f = fract(s);
+    if (seg <= 0) return mix(c0, c1, f);
+    if (seg == 1) return mix(c1, c2, f);
+    if (seg == 2) return mix(c2, c3, f);
+    if (seg == 3) return mix(c3, c4, f);
+    if (seg == 4) return mix(c4, c5, f);
+    return mix(c5, c6, f);
+}
+
+vec3 coolwarm(float t) {
+    t = clamp(t, 0.0, 1.0);
+    vec3 cool = vec3(0.1, 0.3, 0.8);
+    vec3 mid  = vec3(0.9, 0.9, 0.9);
+    vec3 warm = vec3(0.8, 0.1, 0.1);
+    if (t < 0.5) return mix(cool, mid, t * 2.0);
+    else return mix(mid, warm, (t - 0.5) * 2.0);
+}
+
+float query_mpm_mass(ivec2 cell) {
+    if (cell.x < 0 || cell.y < 0 || cell.x >= u_mpm_grid_res.x || cell.y >= u_mpm_grid_res.y) {
+        return 0.0;
+    }
+    uint ci = uint(cell.y * u_mpm_grid_res.x + cell.x);
+    return float(mpm_grid_mass[ci]) * INV_FIXED_SCALE;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= u_count) return;
+
+    uint i = u_offset + idx;
+    vec2 pos_i = positions[i];
+    vec2 vel_i = velocities[i];
+    float rho_i = densities[i];
+    uint mat_i = material_ids[i] & 0x7Fu;
+    float temp_i = temperatures[i];
+    float state_i = thermal_state[idx];
+    vec4 mat_param_i = material_params[idx];
+
+    if (u_enable_thermal == 1) {
+        float src_w = heat_falloff(pos_i, u_heat_pos, u_heat_radius);
+        if (src_w > 0.0) {
+            temp_i += (u_heat_temp - temp_i) * src_w * 1.8 * u_dt;
+        }
+        float gun_w = heat_falloff(pos_i, u_heat_gun_pos, u_heat_gun_radius);
+        if (gun_w > 0.0 && abs(u_heat_gun_power) > 1e-4) {
+            temp_i += u_heat_gun_power * gun_w * 0.85 * u_dt;
+        }
+
+        if (mat_i == MAT_SPH_BURNING_OIL) {
+            float ignite = smoothstep(355.0, 445.0, temp_i);
+            state_i += clamp(ignite - state_i, -0.18 * u_dt, 2.3 * u_dt);
+            if (state_i > 0.015) {
+                float flame_core = clamp(state_i * (0.72 + 0.28 * state_i), 0.0, 1.0);
+                temp_i += flame_core * 610.0 * u_dt;
+                temp_i = max(temp_i, mix(455.0, 655.0, flame_core));
+            }
+        } else if (is_boiling_water(mat_i)) {
+            float boil = smoothstep(385.0, 470.0, temp_i);
+            state_i += clamp(boil - state_i, -1.2 * u_dt, 2.4 * u_dt);
+            temp_i -= state_i * 40.0 * u_dt;
+        } else if (mat_i == MAT_SPH_THERMAL_SYRUP) {
+            float hot = smoothstep(330.0, 460.0, temp_i);
+            state_i += clamp(hot - state_i, -1.6 * u_dt, 1.3 * u_dt);
+        } else if (mat_i == MAT_SPH_FLASH_FLUID) {
+            float flash = smoothstep(340.0, 420.0, temp_i);
+            state_i += clamp(flash - state_i, -1.4 * u_dt, 3.2 * u_dt);
+            temp_i -= state_i * 85.0 * u_dt;
+        } else if (mat_i == MAT_SPH_LIGHT_OIL) {
+            float hot = smoothstep(350.0, 520.0, temp_i);
+            state_i += clamp(hot - state_i, -1.2 * u_dt, 1.2 * u_dt);
+        } else if (mat_i == MAT_SPH_VISCOUS_GOO) {
+            float hot = smoothstep(330.0, 430.0, temp_i);
+            state_i += clamp(hot - state_i, -1.0 * u_dt, 1.0 * u_dt);
+        } else {
+            state_i *= max(1.0 - 0.6 * u_dt, 0.0);
+        }
+
+        float cooling_scale = 1.0;
+        if (mat_i == MAT_SPH_BURNING_OIL) cooling_scale = mix(0.38, 0.12, state_i);
+        else if (is_boiling_water(mat_i)) cooling_scale = 0.82;
+        else if (mat_i == MAT_SPH_THERMAL_SYRUP) cooling_scale = mix(0.74, 0.52, state_i);
+        else if (mat_i == MAT_SPH_FLASH_FLUID) cooling_scale = mix(1.15, 1.45, state_i);
+        float air_temp = sample_air_temp(pos_i);
+        float air_surplus = air_temp - temp_i;
+        if (air_surplus > 2.0) {
+            float plume = smoothstep(u_ambient_temp + 28.0, u_ambient_temp + 320.0, air_temp);
+            float air_couple = (mat_i == MAT_SPH_BURNING_OIL) ? 0.42 : 0.22;
+            float transfer_gate = (mat_i == MAT_SPH_BURNING_OIL)
+                ? smoothstep(4.0, 80.0, air_surplus)
+                : smoothstep(8.0, 120.0, air_surplus);
+            temp_i += air_surplus * air_couple * plume * transfer_gate * u_dt;
+        }
+        if (u_use_sdf == 1) {
+            float sdf_contact_w = 0.0;
+            float solid_temp = sample_sdf_contact_temp(pos_i, sdf_contact_w);
+            float solid_surplus = solid_temp - temp_i;
+            if (sdf_contact_w > 1e-4 && solid_surplus > 1.5) {
+                float solid_couple = 0.34;
+                if (mat_i == MAT_SPH_BURNING_OIL) solid_couple = 0.56;
+                else if (is_boiling_water(mat_i)) solid_couple = 0.42;
+                else if (mat_i == MAT_SPH_FLASH_FLUID) solid_couple = 0.48;
+                temp_i += solid_surplus * solid_couple * sdf_contact_w * u_dt;
+            }
+        }
+        temp_i += (u_ambient_temp - temp_i) * u_particle_cooling * cooling_scale * u_dt;
+    } else {
+        state_i *= max(1.0 - 0.8 * u_dt, 0.0);
+    }
+
+    state_i = clamp(state_i, 0.0, 1.0);
+    temp_i = clamp(temp_i, 0.0, 1600.0);
+
+    float rho0_i, gas_k_i, visc_i, surface_scale_i, thermal_buoy_i, hot_i;
+    fluid_props(mat_i, mat_param_i, temp_i, state_i,
+                rho0_i, gas_k_i, visc_i, surface_scale_i, thermal_buoy_i, hot_i);
+
+    float p_i = eos_pressure(rho_i, rho0_i, gas_k_i);
+
+    vec2 accel = vec2(0.0);
+    vec2 xsph_correction = vec2(0.0);
+    float curl = 0.0;       // For visualization
+    float div = 0.0;
+    // Surface tension (CSF): accumulate color field gradient + Laplacian
+    vec2 color_grad = vec2(0.0); // ∇c = Σ m_j/ρ_j * ∇W
+    float color_lap = 0.0;       // ∇²c = Σ m_j/ρ_j * ∇²W
+    vec2 interface_grad = vec2(0.0);
+    float interface_lap = 0.0;
+    float temp_mix = 0.0;
+    float temp_weight = 0.0;
+
+    ivec2 cell_i = pos_to_cell_2d(pos_i, u_cell_size, u_world_min);
+
+    // --- Neighbor loop ---
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            uint hash = hash_cell_2d(cell_i + ivec2(dx, dy), u_table_size);
+            uint start = cell_start[hash];
+            uint end_idx = cell_end[hash];
+
+            for (uint s = start; s < end_idx; s++) {
+                uint j = sorted_indices[s];
+                if (j == i) continue;
+
+                vec2 r_vec = pos_i - positions[j];
+                float r = length(r_vec);
+
+                if (r < 2.0 * u_h && r > 1e-6) {
+                    float rho_j = densities[j];
+                    float mass_j = masses[j];
+                    vec2 vel_j = velocities[j];
+                    uint local_j = j - u_offset;
+                    uint mat_j = material_ids[j] & 0x7Fu;
+                    float temp_j = temperatures[j];
+                    float state_j = thermal_state[local_j];
+                    vec4 mat_param_j = material_params[local_j];
+                    float rho0_j, gas_k_j, visc_j, surface_scale_j, thermal_buoy_j, hot_j;
+                    fluid_props(mat_j, mat_param_j, temp_j, state_j,
+                                rho0_j, gas_k_j, visc_j, surface_scale_j, thermal_buoy_j, hot_j);
+                    float p_j = eos_pressure(rho_j, rho0_j, gas_k_j);
+                    float immiscibility = (u_enable_interfaces == 1) ? immiscibility_pair(mat_i, mat_j) : 0.0;
+                    float cross_mix_scale = mix(1.0, clamp(u_cross_mix, 0.0, 1.0), immiscibility);
+                    float thermal_mix_scale = mix(1.0, clamp(u_cross_thermal_mix, 0.0, 1.0), immiscibility);
+
+                    vec2 dir = r_vec / r;
+                    float w = W_cubic(r, u_h);
+                    float dw = dW_cubic(r, u_h);
+
+                    // Pressure force (symmetric SPH)
+                    accel -= mass_j * (p_i / (rho_i * rho_i) + p_j / (rho_j * rho_j)) * dw * dir;
+
+                    // Artificial viscosity (Monaghan)
+                    vec2 v_ij = vel_i - vel_j;
+                    float v_dot_r = dot(v_ij, r_vec);
+                    if (v_dot_r < 0.0) {
+                        float mu = u_h * v_dot_r / (r * r + 0.01 * u_h * u_h);
+                        float visc_pair = 0.5 * (visc_i + visc_j);
+                        float pi_ij = (-visc_pair * mu) / (0.5 * (rho_i + rho_j));
+                        accel -= mass_j * pi_ij * dw * dir;
+                    }
+
+                    // XSPH velocity smoothing (prevents clustering)
+                    xsph_correction += mass_j / (0.5 * (rho_i + rho_j)) * (vel_j - vel_i) * w * cross_mix_scale;
+
+                    // Diagnostics: curl and divergence (for visualization)
+                    // curl(v) in 2D = dvy/dx - dvx/dy
+                    // div(v)  in 2D = dvx/dx + dvy/dy
+                    // SPH estimate: curl ≈ -sum_j m_j/rho_j * (v_j - v_i) x grad_W
+                    //               div  ≈ -sum_j m_j/rho_j * (v_j - v_i) . grad_W
+                    vec2 grad_w = dw * dir;
+                    vec2 dv = vel_j - vel_i;
+                    curl += mass_j / rho_j * (dv.x * grad_w.y - dv.y * grad_w.x);
+                    div  += mass_j / rho_j * dot(dv, grad_w);
+
+                    // Surface tension: color field gradient and Laplacian
+                    if (u_surface_tension > 0.0) {
+                        float vol_j = mass_j / rho_j;
+                        // Laplacian approximation: ∇²W ≈ 2*(d+2)/h² * (W - W_0) for 2D
+                        float lap_w = 2.0 * 4.0 / (u_h * u_h) * (w - W_cubic(0.0, u_h));
+                        if (immiscibility > 0.0) {
+                            interface_grad += immiscibility * vol_j * dw * dir;
+                            interface_lap += immiscibility * vol_j * lap_w;
+                        } else {
+                            color_grad += vol_j * dw * dir;
+                            color_lap += vol_j * lap_w;
+                        }
+                    }
+
+                    if (immiscibility > 0.0 && u_interface_repulsion > 0.0) {
+                        float vol_j = mass_j / max(rho_j, 1.0);
+                        float q = clamp(1.0 - r / (1.35 * u_h), 0.0, 1.0);
+                        accel += u_interface_repulsion * immiscibility * vol_j * q * q * dir;
+                    }
+
+                    if (u_enable_thermal == 1) {
+                        // Symmetric (reciprocal) thermal weight: dividing by rho_j alone
+                        // would bias heat transfer toward high-density neighbors and prevent
+                        // multi-phase systems (e.g. hot air vs cold SPH water) from ever
+                        // reaching thermal equilibrium. Averaging rho_i and rho_j gives
+                        // equal-and-opposite heat flow between particles.
+                        float rho_bar = max(0.5 * (rho_i + rho_j), 1.0);
+                        float mix_w = mass_j / rho_bar * w * thermal_mix_scale;
+                        temp_mix += (temp_j - temp_i) * mix_w;
+                        temp_weight += mix_w;
+                    }
+                }
+            }
+        }
+    }
+
+    // Surface tension force (CSF model)
+    if (u_surface_tension > 0.0) {
+        float cg_len = length(color_grad);
+        if (cg_len > 0.1) { // Only apply at surface (high gradient)
+            vec2 surface_normal = color_grad / cg_len;
+            float curvature = -color_lap / cg_len;
+            accel += (u_surface_tension * surface_scale_i) * curvature * surface_normal / rho_i;
+        }
+        float ig_len = length(interface_grad);
+        if (ig_len > 0.05) {
+            vec2 interface_normal = interface_grad / ig_len;
+            float curvature = -interface_lap / ig_len;
+            accel += (u_interface_tension * surface_scale_i) * curvature * interface_normal / rho_i;
+        }
+    }
+
+    if (u_enable_thermal == 1 && temp_weight > 1e-6) {
+        float thermal_diff = 1.2;
+        if (mat_i == MAT_SPH_BURNING_OIL) thermal_diff = 0.84;
+        else if (is_boiling_water(mat_i)) thermal_diff = 1.5;
+        else if (mat_i == MAT_SPH_THERMAL_SYRUP) thermal_diff = 0.9;
+        else if (mat_i == MAT_SPH_FLASH_FLUID) thermal_diff = 1.8;
+        temp_i += thermal_diff * temp_mix / temp_weight * u_dt * 18.0;
+    }
+
+    // Gravity
+    accel += u_gravity;
+    if (u_enable_thermal == 1) {
+        accel += vec2(0.0, thermal_buoy_i);
+        if (is_boiling_water(mat_i)) {
+            float bubble = sin(u_time * 24.0 + pos_i.x * 28.0 + pos_i.y * 17.0);
+            accel += vec2(bubble * 0.8, 1.8 + abs(bubble) * 1.3) * state_i;
+        } else if (mat_i == MAT_SPH_FLASH_FLUID) {
+            float flash = sin(u_time * 32.0 + pos_i.x * 35.0 + pos_i.y * 19.0);
+            accel += vec2(flash * 1.5, 3.4 + abs(flash) * 1.4) * state_i;
+        } else if (mat_i == MAT_SPH_BURNING_OIL) {
+            float flame = sin(u_time * 18.0 + pos_i.x * 20.0 + pos_i.y * 9.0);
+            accel += vec2(flame * 0.7, 1.8) * state_i;
+        }
+    }
+
+    // Mouse force
+    if (u_mouse_force != 0.0) {
+        vec2 to_mouse = u_mouse_world - pos_i;
+        float dist = length(to_mouse);
+        if (u_mouse_mode == 3) {
+            // Real Drag: per-particle target
+            float w = spring_weight[idx];
+            if (w > 0.0) {
+                vec2 target = u_mouse_world + spring_anchor[idx];
+                vec2 to_target = target - pos_i;
+                accel += to_target * (u_mouse_force * w);
+                accel -= vel_i * (u_mouse_damping * w);
+            }
+        } else if (u_mouse_mode == 1) {
+            // Telekinesis: uniform force
+            float w = spring_weight[idx];
+            if (w > 0.0) {
+                vec2 force_dir = u_mouse_world - u_spring_origin;
+                accel += force_dir * (u_mouse_force * w);
+                accel -= vel_i * (u_mouse_damping * w);
+            }
+        } else if (dist < u_mouse_radius && dist > 1e-4) {
+            float hard_r = clamp(u_mouse_inner_radius, 0.0, u_mouse_radius);
+            float shell = max(u_mouse_radius - hard_r, 1e-4);
+            float falloff = 1.0;
+            if (dist > hard_r && u_mouse_radius > hard_r + 1e-4) {
+                float t = clamp((dist - hard_r) / shell, 0.0, 1.0);
+                falloff = 1.0 - t * t * (3.0 - 2.0 * t);
+            }
+            if (u_mouse_mode == 2 && length(u_mouse_dir) > 1e-5) {
+                float sweep = (dist <= hard_r) ? 1.0 : clamp(1.0 - (dist - hard_r) / shell, 0.0, 1.0);
+                accel += normalize(u_mouse_dir) * u_mouse_force * sweep * sweep;
+            } else {
+                accel += (to_mouse / dist) * u_mouse_force * falloff;
+            }
+        }
+    }
+
+    // Full-reaction mode keeps a LOCAL contact ledger, not a difference of total
+    // force (which would accidentally charge gravity/SPH/mouse forces to MPM).
+    // Depenetration changes position only; later SDF/velocity limits are outside
+    // this ledger. Existing penalty-only v2 remains unchanged when this is off.
+    bool full_reaction = (u_coupling_v2 == 1 && u_full_contact_reaction == 1);
+    vec2 contact_position = pos_i;
+    vec2 contact_delta_v = vec2(0.0);
+
+    // SPH <-> MPM coupling: build a soft occupancy boundary from nearby MPM
+    // grid mass, then apply outward recovery and damping. This keeps SPH in
+    // contact with hot MPM surfaces, but prevents it from tunneling deep into
+    // solid-looking MPM blobs.
+    if (u_use_mpm_coupling == 1 && u_mpm_dx > 1e-6) {
+        vec2 mpm_cell_f = (pos_i - u_mpm_grid_origin) / u_mpm_dx;
+        ivec2 mpm_cell = ivec2(floor(mpm_cell_f));
+        if (mpm_cell.x >= 0 && mpm_cell.y >= 0 &&
+            mpm_cell.x < u_mpm_grid_res.x && mpm_cell.y < u_mpm_grid_res.y) {
+            float occupied_mass = 0.0;
+            float weighted_mass = 0.0;
+            vec2 weighted_center = vec2(0.0);
+
+            for (int my = -1; my <= 1; ++my) {
+                for (int mx = -1; mx <= 1; ++mx) {
+                    ivec2 mc = mpm_cell + ivec2(mx, my);
+                    float gm = query_mpm_mass(mc);
+                    if (gm <= 1e-4) continue;
+                    vec2 center = vec2(mc) + vec2(0.5);
+                    float dist = length(center - mpm_cell_f);
+                    float w = max(1.15 - dist, 0.0);
+                    float mw = gm * w;
+                    weighted_mass += mw;
+                    weighted_center += center * mw;
+                    if (mx == 0 && my == 0) occupied_mass = gm;
+                }
+            }
+
+            if (weighted_mass > 0.010) {
+                vec2 local_center = weighted_center / weighted_mass;
+                vec2 mass_grad = vec2(
+                    query_mpm_mass(mpm_cell + ivec2(1, 0)) - query_mpm_mass(mpm_cell + ivec2(-1, 0)),
+                    query_mpm_mass(mpm_cell + ivec2(0, 1)) - query_mpm_mass(mpm_cell + ivec2(0, -1))
+                );
+                vec2 push_dir = vec2(0.0);
+                float grad_len = length(mass_grad);
+                if (grad_len > 1e-5) {
+                    push_dir = -mass_grad / grad_len;
+                } else {
+                    vec2 away = mpm_cell_f - local_center;
+                    float away_len = length(away);
+                    if (away_len > 1e-5) push_dir = away / away_len;
+                }
+
+                float occupancy = smoothstep(0.006, 0.12, weighted_mass);
+                float core = smoothstep(0.010, 0.070, occupied_mass);
+                float center_dist = length(mpm_cell_f - local_center);
+                float interior = 1.0 - smoothstep(0.16, 0.72, center_dist);
+                if (length(push_dir) > 1e-5) {
+                    float repel = u_mpm_contact_push * (0.25 + 0.85 * occupancy + 1.35 * core + 0.95 * interior);
+                    accel += push_dir * repel;
+                    if (full_reaction) contact_delta_v += push_dir * repel * u_dt;
+
+                    float recover = clamp(u_mpm_contact_recovery *
+                                          (0.18 + 0.85 * occupancy + 1.20 * core + 1.10 * interior),
+                                          0.0, 0.28);
+                    if (u_coupling_v2 == 1 && u_emit_reaction == 1 && !full_reaction) {
+                        // Newton's 3rd law: the MPM material pushed this SPH particle
+                        // with accel `push_dir*repel`, so it receives -m*accel*dt.
+                        // (Legacy deposited nothing -- SPH felt MPM as a static
+                        // collider and MPM never felt SPH at all.)
+                        // masses[] is a SHARED buffer -> global index i. The reaction
+                        // image is SPH-local (sized to the SPH range) -> local idx.
+                        vec2 reaction = -push_dir * repel * masses[i] * u_dt;
+                        imageStore(u_sph_reaction, int(idx), vec4(reaction, 0.0, 0.0));
+                    }
+                    if (u_coupling_v2 == 1) {
+                        // Coupling v2 -- PASSIVE response (no energy injected at contact).
+                        // (a) Recovery is dt-BASED: legacy pushed a fixed fraction of dx per
+                        //     FRAME, so the depenetration speed scaled with dx and with frame
+                        //     rate, not with time. u_mpm_recover_rate defaults to 120 so the
+                        //     magnitude matches legacy at the nominal 1/120 s step while now
+                        //     scaling correctly at any dt.
+                        pos_i += push_dir * (recover * u_mpm_dx * u_mpm_recover_rate * u_dt);
+                        // (b) Restitution is CLAMPED <= 1. The legacy factor reached
+                        //     1.05+1.30+0.75 = 3.10; since k=1 kills the normal velocity and
+                        //     k=2 reflects it perfectly, k=3.10 REVERSES it at ~2.1x speed --
+                        //     injecting kinetic energy at resting contact, which is what makes
+                        //     fluid pop and jitter out of concave MPM pockets. k = 1+e with
+                        //     e in [0,1] can never add energy.
+                        float inward = dot(vel_i, push_dir);
+                        if (inward < 0.0) {
+                            float e = clamp(u_mpm_restitution, 0.0, 1.0);
+                            vec2 before_restitution = vel_i;
+                            vel_i -= inward * push_dir * (1.0 + e);
+                            if (full_reaction) contact_delta_v += vel_i - before_restitution;
+                        }
+                    } else {
+                    pos_i += push_dir * (recover * u_mpm_dx);
+
+                    float inward = dot(vel_i, push_dir);
+                    if (inward < 0.0) {
+                        vel_i -= inward * push_dir * (1.05 + 1.30 * core + 0.75 * interior);
+                    }
+                    }
+                }
+                accel -= vel_i * (u_mpm_contact_damping *
+                                  (0.20 + 0.70 * occupancy + 0.75 * core + 0.45 * interior));
+                if (full_reaction) {
+                    contact_delta_v -= vel_i * (u_mpm_contact_damping *
+                        (0.20 + 0.70 * occupancy + 0.75 * core + 0.45 * interior)) * u_dt;
+                }
+            }
+        }
+    }
+
+    if (full_reaction && u_emit_reaction == 1) {
+        // XY = equal-and-opposite impulse; ZW = original sampling position.
+        // Write even for zero contact, so reuse/leave-contact cannot replay a record.
+        imageStore(u_sph_reaction, int(idx),
+            vec4(-masses[i] * contact_delta_v, contact_position));
+    }
+
+    // --- Integrate ---
+    vel_i += accel * u_dt;
+
+    // XSPH: smooth velocity with neighbors (anti-clustering)
+    vel_i += u_xsph * xsph_correction;
+
+    // --- SDF ray-march CCD collision ---
+    if (u_use_sdf == 1) {
+        // Push out if already inside
+        float d0 = query_sdf(pos_i);
+        if (d0 < 0.001) {
+            vec2 n0 = sdf_normal(pos_i);
+            pos_i += n0 * (0.002 - d0);
+            float vn = dot(vel_i, n0);
+            if (vn < 0.0) vel_i -= 1.5 * vn * n0;
+        }
+
+        vec2 disp = vel_i * u_dt;
+        float move_dist = length(disp);
+
+        if (move_dist > 1e-8) {
+            vec2 ray_dir = disp / move_dist;
+            float t = 0.0;
+            float rem = move_dist;
+            const float SKIN = 0.002;
+            bool hit = false;
+
+            for (int step = 0; step < 12 && rem > 0.0; step++) {
+                vec2 p = pos_i + ray_dir * t;
+                float d = query_sdf(p);
+
+                if (d <= SKIN) {
+                    hit = true;
+                    vec2 n = sdf_normal(p);
+                    pos_i = p + n * SKIN;
+
+                    float vn = dot(vel_i, n);
+                    if (vn < 0.0) vel_i -= 1.3 * vn * n;
+                    vel_i -= 0.15 * (vel_i - dot(vel_i, n) * n); // friction
+
+                    float t_frac = t / move_dist;
+                    disp = vel_i * u_dt * (1.0 - t_frac);
+                    move_dist = length(disp);
+                    if (move_dist < 1e-8) break;
+                    ray_dir = disp / move_dist;
+                    t = 0.0;
+                    rem = move_dist;
+                } else {
+                    float adv = min(max(d - SKIN, SKIN * 0.5), rem);
+                    t += adv;
+                    rem -= adv;
+                }
+            }
+
+            if (!hit) pos_i += disp;
+        }
+
+        // Safety clamp
+        float df = query_sdf(pos_i);
+        if (df < 0.0) {
+            vec2 n = sdf_normal(pos_i);
+            pos_i += n * (-df + 0.003);
+            float vn = dot(vel_i, n);
+            if (vn < 0.0) vel_i -= 1.5 * vn * n;
+        }
+    } else {
+        pos_i += vel_i * u_dt;
+        float damp = 0.5;
+        if (pos_i.x < u_bound_min.x) { pos_i.x = u_bound_min.x; vel_i.x = abs(vel_i.x) * damp; }
+        if (pos_i.x > u_bound_max.x) { pos_i.x = u_bound_max.x; vel_i.x = -abs(vel_i.x) * damp; }
+        if (pos_i.y < u_bound_min.y) { pos_i.y = u_bound_min.y; vel_i.y = abs(vel_i.y) * damp; }
+        if (pos_i.y > u_bound_max.y) { pos_i.y = u_bound_max.y; vel_i.y = -abs(vel_i.y) * damp; }
+    }
+
+    velocities[i] = vel_i;
+    positions[i] = pos_i;
+    temperatures[i] = temp_i;
+    thermal_state[idx] = state_i;
+
+    // --- Visualization color ---
+    if (u_keep_colors == 1) {
+        vec3 heat_tint = mix(vec3(0.28, 0.52, 1.0), vec3(1.0, 0.42, 0.08), clamp(hot_i + state_i * 0.35, 0.0, 1.0));
+        if (i >= u_highlight_start && i < u_highlight_end) {
+            vec4 cur = colors[i];
+            float pulse = sin(u_time * 6.0) * 0.3 + 0.7;
+            vec3 gold = vec3(1.0, 0.85, 0.3);
+            if (u_enable_thermal == 1 && (mat_i >= MAT_SPH_BURNING_OIL || temp_i > u_ambient_temp + 30.0)) {
+                cur.rgb = mix(cur.rgb, heat_tint, clamp(0.28 + state_i * 0.35 + hot_i * 0.18, 0.0, 0.7));
+            }
+            cur.rgb = mix(cur.rgb, gold, 0.5 * pulse);
+            cur.rgb += gold * 0.4 * pulse;
+            colors[i] = cur;
+        } else if ((u_mouse_mode == 1 || u_mouse_mode == 3) && spring_weight[idx] > 0.0) {
+            vec4 cur = colors[i];
+            if (u_enable_thermal == 1 && (mat_i >= MAT_SPH_BURNING_OIL || temp_i > u_ambient_temp + 30.0)) {
+                cur.rgb = mix(cur.rgb, heat_tint, clamp(0.22 + state_i * 0.30 + hot_i * 0.15, 0.0, 0.6));
+            }
+            cur.rgb = mix(cur.rgb, vec3(0.36, 0.84, 1.0), 0.38);
+            colors[i] = cur;
+        } else if (u_enable_thermal == 1 && (mat_i >= MAT_SPH_BURNING_OIL || temp_i > u_ambient_temp + 30.0)) {
+            vec4 cur = colors[i];
+            cur.rgb = mix(cur.rgb, heat_tint, clamp(0.18 + state_i * 0.28 + hot_i * 0.12, 0.0, 0.55));
+            colors[i] = cur;
+        }
+        return;
+    }
+
+    vec4 color;
+    if (u_vis_mode == 1) {
+        // Velocity magnitude
+        float speed = length(vel_i);
+        color = vec4(viridis(speed * 0.3), 1.0);
+    } else if (u_vis_mode == 2) {
+        // Pressure (blue=low, red=high)
+        float p_norm = p_i / (u_gas_constant * u_rest_density * 0.05 + 1e-6);
+        color = vec4(coolwarm(p_norm * 0.5 + 0.5), 1.0);
+    } else if (u_vis_mode == 3) {
+        // Density ratio
+        float rho_ratio = rho_i / u_rest_density;
+        color = vec4(viridis((rho_ratio - 0.8) * 2.5), 1.0);
+    } else if (u_vis_mode == 4) {
+        // Curl (vorticity) — blue=CW, red=CCW
+        float curl_norm = curl * 0.05;
+        color = vec4(coolwarm(curl_norm * 0.5 + 0.5), 1.0);
+    } else if (u_vis_mode == 5) {
+        // Divergence — blue=converging, red=diverging
+        float div_norm = div * 0.1;
+        color = vec4(coolwarm(div_norm * 0.5 + 0.5), 1.0);
+    } else if (u_vis_mode == 6) {
+        // Codimensional: blue=2D bulk, red=1D thread
+        uint local_idx = i - u_offset;
+        vec4 cd = codim_data_vis[local_idx];
+        float dim_ratio = cd.z; // 0=pure 1D, 1=pure 2D
+        vec3 c;
+        if (dim_ratio < 0.25) {
+            // 1D thread: bright red/orange, show tangent direction
+            c = mix(vec3(1.0, 0.2, 0.1), vec3(1.0, 0.6, 0.1), dim_ratio * 4.0);
+        } else {
+            // 2D bulk: blue, intensity by how close to threshold
+            c = mix(vec3(0.1, 0.4, 0.9), vec3(0.15, 0.5, 0.6), clamp((dim_ratio - 0.25) * 2.0, 0.0, 1.0));
+        }
+        color = vec4(c, 1.0);
+    } else if (u_vis_mode == 7) {
+        float t_norm = clamp((temp_i - 260.0) / 520.0, 0.0, 1.0);
+        color = vec4(mix(vec3(0.18, 0.44, 1.0), vec3(1.0, 0.36, 0.08), t_norm), 1.0);
+    } else {
+        float rho_ratio = rho_i / max(rho0_i, 1.0);
+        vec3 base = fluid_base_color(mat_i, hot_i, state_i, rho_ratio);
+        float speed = length(vel_i);
+        color = vec4(base + vec3(speed * 0.015, speed * 0.008, speed * 0.010), 1.0);
+    }
+    // Golden highlight
+    if (i >= u_highlight_start && i < u_highlight_end) {
+        float pulse = sin(u_time * 6.0) * 0.3 + 0.7;
+        vec3 gold = vec3(1.0, 0.85, 0.3);
+        color.rgb = mix(color.rgb, gold, 0.5 * pulse);
+        color.rgb += gold * 0.4 * pulse;
+    }
+    if ((u_mouse_mode == 1 || u_mouse_mode == 3) && spring_weight[idx] > 0.0) {
+        color.rgb = mix(color.rgb, vec3(0.40, 0.90, 1.0), 0.45);
+    }
+    colors[i] = color;
+}

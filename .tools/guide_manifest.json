@@ -1,0 +1,3078 @@
+[
+ {
+  "section": "01-tungsten-photon-primitives",
+  "files": [
+   {
+    "path": "photon-map/photon.cpp",
+    "title": "PhotonPrimitive::precompute: path segment to primitive",
+    "language": "cpp",
+    "why": "The shortest complete entry point, all mine: a stored photon path segment becomes a primitive by choosing the segment for the strategy/primitive pair, pulling vertices from the dangling store when one exists, and caching direction, length, origin and bounds. The early return at segnum_strat > I_mybounce leaves the primitive invalid.",
+    "highlights": [
+     {
+      "start": 52,
+      "end": 84,
+      "caption": "Strategy/primitive descriptors fix the segment counts; extended_dim is the surplus of strategy over primitive segments, and the start index is the bounce minus the strategy length"
+     },
+     {
+      "start": 100,
+      "end": 126,
+      "caption": "Path vertices come from the dangling-segment store when the photon has one, otherwise from the raw array; the affected-bounce set selects P, V and vertex indices"
+     },
+     {
+      "start": 128,
+      "end": 142,
+      "caption": "Cache direction and length per segment, take power from the first affected vertex, then set origin, validity and the bounding box"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "PhotonPrimitive::initialize_globals",
+      "line": 28
+     },
+     {
+      "name": "PP_PRIM::initialize_globals",
+      "line": 38
+     },
+     {
+      "name": "PhotonPrimitive::precompute",
+      "line": 54
+     }
+    ]
+   },
+   {
+    "path": "photon-map/Photon.hpp",
+    "title": "PP_PRIM: analytic intersection, Jacobians, per-primitive cache",
+    "language": "cpp",
+    "why": "The primitive itself (class PP_PRIM, line 1046): intersect solves ray–primitive analytically per type in the primitive's own frame, _update_constJAC caches the closed-form Jacobian factor that keeps the density estimate unbiased, and precompute builds the sub-path, re-traces non-marginalizable segments and sets the local frame. 3,099 added lines over 122 kept; inter_ucube_at_orig (line 1221) is credited to a colleague and is not mine. Note the style: intersect returns an intersection_solution object whose intersection_root records carry typed hit coordinates (UV, UVW, T) — the object-oriented form. The later solver in RadianceLab (02, pp_hourglass_sheet_solver.cpp) writes roots and Jacobians into flat fixed arrays instead: the same mathematics, with elegance traded for throughput.",
+    "highlights": [
+     {
+      "start": 1342,
+      "end": 1380,
+      "caption": "Cone intersection: ray into the primitive frame, tan of the half-angle from |k×dprev|/(k·dprev), quadratic in the (y,z) components minus x²·tan², roots sorted near-first"
+     },
+     {
+      "start": 1689,
+      "end": 1727,
+      "caption": "_update_constJAC: constant part of the Jacobian per type — plane and parallelepiped from cross/triple products of key vectors, disk and edge primitives from the previous direction and the edge"
+     },
+     {
+      "start": 2049,
+      "end": 2077,
+      "caption": "Sub-path generation: the first non-marginalizable segment keeps its stored direction and marginal length, later segments are re-traced with exponential free-flight samples"
+     },
+     {
+      "start": 2100,
+      "end": 2137,
+      "caption": "Local frame per primitive type: parallelepiped from the three geo vectors; sphere and cone from dprev and the first direction; cylinder origin shifted along the axis by the cap"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "PP_subpath",
+      "line": 897
+     },
+     {
+      "name": "PP_PRIM",
+      "line": 1046
+     },
+     {
+      "name": "PP_PRIM::intersect",
+      "line": 1275
+     },
+     {
+      "name": "PP_PRIM::_update_constJAC",
+      "line": 1689
+     },
+     {
+      "name": "PP_PRIM::kv_from_root",
+      "line": 1729
+     },
+     {
+      "name": "PP_PRIM::precompute",
+      "line": 1949
+     },
+     {
+      "name": "PhotonPrimitive",
+      "line": 2509
+     },
+     {
+      "name": "PhotonPrimitive::precompute_as_beam",
+      "line": 2728
+     }
+    ]
+   },
+   {
+    "path": "experimental-path-tracer/PathTracer.cpp",
+    "title": "Uncorrelated photon primitives in the path-tracer framework",
+    "language": "cpp",
+    "why": "The same idea as PP_PRIM, manifested in the other framework. Upstream's path tracer is a few dozen lines; this version turns each camera sample into a photon-primitive estimate on the fly: draw a light position, direction and free-flight distance, build the sheet those sampled dimensions sweep (plane, cone, sphere, cylinder), intersect the camera ray with it analytically, and divide by the same Jacobian. No stored photon map, so no correlation between pixels and nothing to cache; the photon-map side freezes primitives from stored paths and reuses them. Compare inter here with PP_PRIM::intersect and the closing Jacobian factor with _update_constJAC.",
+    "highlights": [
+     {
+      "caption": "Which sampled dimensions (distance, theta, phi, at which vertices) sweep which sheet: the same taxonomy the photon-map primitives use",
+      "start": 49,
+      "end": 88
+     },
+     {
+      "caption": "Analytic ray–plane hit with the (u, v) coordinates in the sheet's own frame and long/short edge bounds; cone, sphere and cylinder follow in the same switch",
+      "start": 156,
+      "end": 211
+     },
+     {
+      "caption": "Transmittance-times-phase transport weight and the free-flight density used to turn a sampled distance into an area measure",
+      "start": 505,
+      "end": 519
+     },
+     {
+      "caption": "One estimator: sample the light subpath and free flight, build the plane sheet, intersect, test occlusion, then emission × transmittance × phase × σs/σt divided by |(u × v) · d| — the flat Jacobian",
+      "start": 818,
+      "end": 878
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "iz / surf_type",
+      "line": 73
+     },
+     {
+      "name": "inter",
+      "line": 156
+     },
+     {
+      "name": "TP",
+      "line": 505
+     },
+     {
+      "name": "PDF_t",
+      "line": 514
+     },
+     {
+      "name": "intpoints",
+      "line": 525
+     },
+     {
+      "name": "PathTracer::reeval",
+      "line": 545
+     },
+     {
+      "name": "PathTracer::routine",
+      "line": 691
+     },
+     {
+      "name": "PathTracer::traceSample",
+      "line": 1753
+     }
+    ]
+   },
+   {
+    "path": "photon-map/PhotonMapIntegrator.cpp",
+    "title": "Integrator glue: marginal segments, dangling paths, primitive build",
+    "language": "cpp",
+    "why": "Connects traced photon paths to primitive construction: after the bracket/strategy pass, every vertex gets a sampled marginalizable direction and free-flight distance, missing bounces are appended as dangling segments, then one primitive per photon is precomputed and placed in a BVH. COMB_ALL is an unimplemented branch; the surrounding integrator skeleton is upstream.",
+    "highlights": [
+     {
+      "start": 611,
+      "end": 647,
+      "caption": "Append missing bounces from stored marginal direction/length pairs with running bounce counters, then re-derive dir, length and dir_marg between consecutive dangling vertices"
+     },
+     {
+      "start": 737,
+      "end": 770,
+      "caption": "Add_marg_segments: every vertex samples a marginalizable direction (homogeneous phase) and free-flight distance (homogeneous transmittance) so any edge can be replaced analytically"
+     },
+     {
+      "start": 1029,
+      "end": 1067,
+      "caption": "prepare_PhotonPrimitives: the handler chosen in post-processing picks the strategy; COMB_1PRIM draws one primitive uniformly and precomputes it, COMB_ALL is unimplemented"
+     },
+     {
+      "start": 1113,
+      "end": 1149,
+      "caption": "Pipeline order for VOLUME_PRIMITIVES: compact, normalise power, bracket/strategy pass, marginal segments, dangling segments, primitive precompute, acceleration structure"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "PhotonMapIntegrator::makePrimitiveBVH",
+      "line": 393
+     },
+     {
+      "name": "PhotonMapIntegrator::makeDanglingBVH",
+      "line": 481
+     },
+     {
+      "name": "PhotonMapIntegrator::buildPrimitiveAccStructure",
+      "line": 541
+     },
+     {
+      "name": "PhotonMapIntegrator::Add_Dangling_Segments",
+      "line": 564
+     },
+     {
+      "name": "PhotonMapIntegrator::Add_marg_segments",
+      "line": 737
+     },
+     {
+      "name": "PhotonMapIntegrator::PostProcess_PathPhotons",
+      "line": 772
+     },
+     {
+      "name": "PhotonMapIntegrator::prepare_PhotonPrimitives",
+      "line": 1029
+     },
+     {
+      "name": "PhotonMapIntegrator::buildPhotonDataStructures",
+      "line": 1069
+     }
+    ]
+   },
+   {
+    "path": "photon-map/GridAccel.hpp",
+    "title": "Grid accelerator extended from points to extended primitives",
+    "language": "cpp",
+    "why": "Upstream's beam/trapezoid grid extended to photon primitives: iteratePrimitive rasterizes a plane, parallelepiped, sphere shell, solid sphere or cone into grid cells with a half-cell-diagonal slack, and buildAccel_primitives reuses the two-pass atomic counting-sort build. The point/beam grid and trace are upstream.",
+    "highlights": [
+     {
+      "start": 174,
+      "end": 198,
+      "caption": "iteratePrimitive prologue: bbox, origin and geo segment vectors mapped into grid space; half-cell size and sqrt(3) slack for conservative per-cell tests"
+     },
+     {
+      "start": 280,
+      "end": 314,
+      "caption": "PRIM2_SPHERE keeps cells whose center lies within half a cell diagonal of the radius (a shell); PRIM3_SSPHERE keeps the whole ball"
+     },
+     {
+      "start": 315,
+      "end": 349,
+      "caption": "Cone rasterization: sign test against the axis dprev, then a height band of ±half-diagonal converted to a slant-length range through the reference cosine"
+     },
+     {
+      "start": 353,
+      "end": 383,
+      "caption": "buildAccel_primitives: parallel atomic per-cell counts, serial prefix sum, parallel scatter of primitive indices into cell lists (two-pass counting sort)"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "GridAccel::GridAccel (PP_PRIM overload)",
+      "line": 39
+     },
+     {
+      "name": "GridAccel::iterateBounds",
+      "line": 84
+     },
+     {
+      "name": "GridAccel::iteratePrimitive",
+      "line": 174
+     },
+     {
+      "name": "GridAccel::buildAccel_primitives",
+      "line": 353
+     },
+     {
+      "name": "GridAccel::trace",
+      "line": 462
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "section": "02-radiancelab",
+  "files": [
+   {
+    "path": "pp_hourglass_sheet_solver.cpp",
+    "title": "Photon hourglass: chain geometry and sheet solver",
+    "language": "cpp",
+    "why": "A light ray refracted through a chain of collinear glass balls is revolved about the light-to-centre axis, giving a degree-2 sheet; the camera ray meets it in a ray-centred, double-precision quadratic whose discriminant is the co-area Jacobian the estimator divides by (J² = |N|² − Wτ²), with citardauq root pairing and a branch-recovery test that rejects the mirror-image sheet. Compare the style with the Tungsten intersect routine (01): there an intersection returns a solution object; here roots and Jacobians go into flat fixed arrays, a deliberate trade of elegance for throughput on the hot path.",
+    "highlights": [
+     {
+      "start": 89,
+      "end": 116,
+      "caption": "Link 0 at phi = 0: Snell in, chord t = -2(oc·dir), Snell out, Fresnel T1/T2 carried as deterministic weights, exit TIR excluded by sphere symmetry"
+     },
+     {
+      "start": 170,
+      "end": 181,
+      "caption": "Revolving the exit ray about (apex, axis): meridian numbers z2, rho2, wz, wr, mp and the implicit quadric wz²(|q|²−z²) = (wr z + mp)², scaled by wz² so a perpendicular exit ray is a plane"
+     },
+     {
+      "start": 239,
+      "end": 278,
+      "caption": "Ray-centred double quadratic: exactly-unit axis, dd carried, foot-of-perpendicular shift, J² = |N|² − Wτ² as the discriminant, citardauq pairing with the '−' root first"
+     },
+     {
+      "start": 308,
+      "end": 325,
+      "caption": "Branch recovery: revolution squares the signed radius so the quadric also holds the mirror sheet; the |rhoE + r·wrS| consistency test rejects it"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "PPHgChain",
+      "line": 36
+     },
+     {
+      "name": "ppHgBuildChainGeom",
+      "line": 67
+     },
+     {
+      "name": "ppHgSolveSheet",
+      "line": 235
+     },
+     {
+      "name": "ppHgBuildChain",
+      "line": 290
+     },
+     {
+      "name": "ppHgRecoverBranchAt",
+      "line": 308
+     },
+     {
+      "name": "ppHgRecoverBranch",
+      "line": 326
+     },
+     {
+      "name": "ppHgVertexPdf",
+      "line": 343
+     }
+    ]
+   },
+   {
+    "path": "pp_rasterized_gather.cpp",
+    "title": "Rasterized correlated gather: screen bounds and row gather",
+    "language": "cpp",
+    "why": "Inverts the tracing gather's per-pixel loop: each frozen photon primitive is bounded in screen space by the convex hull of its projected points plus supporting planes through the camera found in double precision, records are counting-sorted into per-scanline lists, and rows are gathered by a parallelFor with thread-local scratch, no atomics, film byte-identical to the tracing gather.",
+    "highlights": [
+     {
+      "start": 142,
+      "end": 177,
+      "caption": "Hull to bound: pixel box with the half-pixel-diagonal guard, then unnormalised edge functions where adding guard·|b−a| slides each line outward by exactly guard pixels"
+     },
+     {
+      "start": 209,
+      "end": 248,
+      "caption": "Straddle case: supporting planes through the camera by brute-force point pairs in double with a 1e-9 relative tolerance, converted to pixel half-planes because ray direction is affine in (px, py)"
+     },
+     {
+      "start": 461,
+      "end": 486,
+      "caption": "Counting sort of record bounds into per-scanline lists; increasing record index within each row keeps the per-pixel addition order and the film's bits"
+     },
+     {
+      "start": 512,
+      "end": 550,
+      "caption": "Row inner loop: lazily built camera ray per pixel, the same crossing closed form, exact-zero skip, and a second accumulator flushed on draw-index change to preserve per-draw grouping"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "ppMakeProj",
+      "line": 63
+     },
+     {
+      "name": "ppHull2D",
+      "line": 113
+     },
+     {
+      "name": "ppRastAddHull",
+      "line": 135
+     },
+     {
+      "name": "ppRastAddCone",
+      "line": 200
+     },
+     {
+      "name": "ppRastRow",
+      "line": 252
+     },
+     {
+      "name": "ppRastBoundOf",
+      "line": 303
+     },
+     {
+      "name": "ppRasterProjCheck",
+      "line": 383
+     },
+     {
+      "name": "ppRasterGather",
+      "line": 408
+     }
+    ]
+   },
+   {
+    "path": "pt_bdpt_mis_excerpt.glsl",
+    "title": "BDPT MIS: area-measure path densities in compute",
+    "language": "glsl",
+    "why": "Forward and reverse area-measure pdfs per vertex of an assembled bidirectional path in a compute shader: full-film camera density, GGX half-vector pdf with the folded preimage, HG phase, medium transmittance, and the NEE-vs-emission density distinction, assembled through Veach s/t site wrappers.",
+    "highlights": [
+     {
+      "start": 4,
+      "end": 22,
+      "caption": "GGX half-vector pdf with both preimages: the sampler folds below-surface directions back above, so the reflected direction's density is added; delta lobes return 0"
+     },
+     {
+      "start": 40,
+      "end": 74,
+      "caption": "Forward pdfA and reverse pdfB in area measure: full-film camera density 1/(A_film cos³), phase or BSDF pdf, cosine-or-σt conversion over l², transmittance in homogeneous media"
+     },
+     {
+      "start": 88,
+      "end": 119,
+      "caption": "NEE area pdf matching sampleLight's conditional distribution: light-selection weighting, sphere cone sampling vs visible hemisphere, distinct from the emission density"
+     },
+     {
+      "start": 178,
+      "end": 208,
+      "caption": "Per-site wrappers enumerating Veach (s, t): light-eye connection, light-to-camera, eye-to-NEE, eye-hits-emitter each assemble the path then call one weight function"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "bsdfPdfW",
+      "line": 4
+     },
+     {
+      "name": "bdptPdfA",
+      "line": 41
+     },
+     {
+      "name": "bdptPdfB",
+      "line": 60
+     },
+     {
+      "name": "bdptWeightB",
+      "line": 80
+     },
+     {
+      "name": "bdptNEEAreaPdf",
+      "line": 90
+     },
+     {
+      "name": "bdptLightOriginPdfPrim",
+      "line": 123
+     },
+     {
+      "name": "bdptWeightB_IC",
+      "line": 179
+     },
+     {
+      "name": "bdptWeightB_nee",
+      "line": 191
+     }
+    ]
+   },
+   {
+    "path": "pt_bdpt_weights.glsl",
+    "title": "BDPT weights: prefix/suffix products in log space",
+    "language": "glsl",
+    "why": "One function turns the per-vertex forward/reverse densities into a balance or power MIS weight: suffix products from the light origin, prefix from the camera, delta-vertex exclusion and vertex-count caps, with the maximum subtracted before exponentiating.",
+    "highlights": [
+     {
+      "start": 1,
+      "end": 22,
+      "caption": "Suffix log-products from the light-origin pdf, prefix from the camera side, validity per strategy t (delta neighbours, vertex-count caps, NEE density vs origin density)"
+     },
+     {
+      "start": 23,
+      "end": 30,
+      "caption": "Balance (scheme 0) as 1/count of valid strategies; power with β = 2 via exp(β(log p_t − top)) normalised by the maximum"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "bdptStrategyLog",
+      "line": 4
+     },
+     {
+      "name": "bdptWeightFromDensities",
+      "line": 5
+     }
+    ]
+   },
+   {
+    "path": "PhaseUnwrap.cpp",
+    "title": "GPU weighted-least-squares phase unwrapping with FFT-preconditioned CG",
+    "language": "cpp",
+    "why": "Wrapped-gradient divergence as RHS, a masked 5-point weighted Laplacian as operator, and preconditioned conjugate gradient with an FFT Poisson preconditioner (radix-2 rows/columns, spectral divide, inverse) run entirely on the GPU; only per-block dot-product partials come back to the host.",
+    "highlights": [
+     {
+      "start": 161,
+      "end": 198,
+      "caption": "Poisson preconditioner: pack real to complex, row then column FFT passes, in-place divide by discrete Laplacian eigenvalues with the (0,0) mode pinned; 1/N per inverse pass cancels the DFT-pair N²"
+     },
+     {
+      "start": 294,
+      "end": 312,
+      "caption": "Dot product as a 256-wide block reduction on the GPU with only the per-block partials read back and summed in double"
+     },
+     {
+      "start": 332,
+      "end": 350,
+      "caption": "The A/b contract: operator and residual shaders share the mask-skip rule and the weighting flag so CG solves the system the RHS was built for"
+     },
+     {
+      "start": 352,
+      "end": 383,
+      "caption": "PCG loop on SSBOs: x = 0, r = b, z = M⁻¹r, p = z, then α = rz/pAp, axpby updates, β = rzNew/rzOld with the preconditioner reapplied each iteration"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "PhaseUnwrap::init",
+      "line": 10
+     },
+     {
+      "name": "PhaseUnwrap::ensureResources",
+      "line": 72
+     },
+     {
+      "name": "PhaseUnwrap::applyPoissonPrecond",
+      "line": 152
+     },
+     {
+      "name": "PhaseUnwrap::run",
+      "line": 225
+     },
+     {
+      "name": "PhaseUnwrap::axpby",
+      "line": 282
+     },
+     {
+      "name": "PhaseUnwrap::dot",
+      "line": 295
+     },
+     {
+      "name": "PhaseUnwrap::applyOperator",
+      "line": 315
+     },
+     {
+      "name": "PhaseUnwrap::runWLS_PCG",
+      "line": 329
+     }
+    ]
+   },
+   {
+    "path": "PPShapeClassify.h",
+    "title": "Swept-vertex shape classifier",
+    "language": "cpp",
+    "why": "Header-only classifier from which (θ, φ, dist) dimensions are swept at which path vertices to the analytic manifold the endpoint family traces (point, arc, circle, sphere cap, cone, disk, planar sector, ball sector, parallelogram / parallelepiped / parallelotope, compound), with the translation-commutation argument written out and degeneracy thresholds exposed. Unit-tested.",
+    "highlights": [
+     {
+      "start": 13,
+      "end": 34,
+      "caption": "Endpoint parametrisation dir(θ, φ) = cosθ A + sinθ (cosφ T + sinφ B) and the sweep-set to shape table"
+     },
+     {
+      "start": 186,
+      "end": 215,
+      "caption": "2-D sweeps: θ+φ gives sphere or cap, φ+dist gives cone with polar (line) and equatorial (disk) degeneracies, θ+dist gives the planar sector"
+     },
+     {
+      "start": 218,
+      "end": 236,
+      "caption": "Path-wide rule: pure translations commute, so an all-dist sweep set is exactly the parallelotope spanned by outDir·dist0·rangeDist per vertex; mixed angular sweeps across vertices are Compound"
+     },
+     {
+      "start": 262,
+      "end": 280,
+      "caption": "All-translation branch: edge vectors collected per dist sweep, classified by count into segment, parallelogram, parallelepiped or parallelotope"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "PPShape",
+      "line": 45
+     },
+     {
+      "name": "ppShapeName",
+      "line": 66
+     },
+     {
+      "name": "PPSweptShapeInput",
+      "line": 89
+     },
+     {
+      "name": "PPShapeResult",
+      "line": 110
+     },
+     {
+      "name": "classifySweptShape",
+      "line": 137
+     },
+     {
+      "name": "PPVertexSweep",
+      "line": 237
+     },
+     {
+      "name": "classifyPathShape",
+      "line": 245
+     }
+    ]
+   },
+   {
+    "path": "BoundaryDerivativeMath.h",
+    "title": "Boundary derivative of pixel radiance under emitter translation",
+    "language": "cpp",
+    "why": "A self-contained differentiable-rendering study: the derivative of pixel radiance with respect to translating a sharp-edged emitter as a boundary integral with the co-area factor 1/|∇u|, Sutherland–Hodgman clipping of the unit pixel against the source half-planes, compared against central finite differences at two step sizes.",
+    "highlights": [
+     {
+      "start": 77,
+      "end": 99,
+      "caption": "Pixel patch: affine receiver coordinates over one pixel from differentiating the camera ray against the local tangent plane rather than re-intersecting the scene"
+     },
+     {
+      "start": 107,
+      "end": 137,
+      "caption": "Sutherland–Hodgman clip of the unit pixel against the four source half-planes and shoelace area for the coverage term"
+     },
+     {
+      "start": 139,
+      "end": 161,
+      "caption": "Edge integral ∫ δ(u−edge) 1{lo ≤ v ≤ hi} over the pixel with the co-area factor 1/|∇u|: line clipped to the pixel square and to the other coordinate's range"
+     },
+     {
+      "start": 162,
+      "end": 181,
+      "caption": "Analytic derivative as direction·(right−left, front−back) edge terms times radiance, next to central finite differences at ε and ε/2"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "intersect",
+      "line": 27
+     },
+     {
+      "name": "patch",
+      "line": 77
+     },
+     {
+      "name": "clip",
+      "line": 109
+     },
+     {
+      "name": "coverage",
+      "line": 123
+     },
+     {
+      "name": "edgeIntegral",
+      "line": 142
+     },
+     {
+      "name": "analyticDerivative",
+      "line": 162
+     },
+     {
+      "name": "evaluate",
+      "line": 172
+     },
+     {
+      "name": "render",
+      "line": 199
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "section": "03-rivx",
+  "files": [
+   {
+    "path": "curve/contour_trace.cpp",
+    "title": "Contour trace: raster field to arc-length polygon",
+    "language": "cpp",
+    "why": "Raster field -> binarize -> largest 8-connected component -> Moore-neighbour boundary trace with Jacob's stopping criterion -> Douglas-Peucker on a closed loop -> resample to N points evenly spaced by arc length. Pure std, deterministic, self-test built in; every stage is iterative so a large solid region cannot blow the stack.",
+    "highlights": [
+     {
+      "start": 57,
+      "end": 94,
+      "caption": "Explicit-stack 8-connected flood fill; prefers the largest component NOT touching the image border so a full-frame background never wins"
+     },
+     {
+      "start": 183,
+      "end": 220,
+      "caption": "Moore-neighbour walk: clockwise scan begins just past the backtrack cell; Jacob's criterion stops on re-entering start with the original first move"
+     },
+     {
+      "start": 285,
+      "end": 320,
+      "caption": "Douglas-Peucker on a closed loop: split at the vertex farthest from loop[0], run two open arcs, wrap endpoint appended as a virtual index 0"
+     },
+     {
+      "start": 355,
+      "end": 388,
+      "caption": "Arc-length resample: cumulative chord table, monotone segment cursor, outN targets at total*i/outN, normalised to [0,1] coords"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "largestComponent",
+      "line": 34
+     },
+     {
+      "name": "traceBoundary",
+      "line": 112
+     },
+     {
+      "name": "dpSegment",
+      "line": 230
+     },
+     {
+      "name": "douglasPeuckerClosed",
+      "line": 280
+     },
+     {
+      "name": "resampleClosed",
+      "line": 333
+     },
+     {
+      "name": "traceDominantContour",
+      "line": 391
+     },
+     {
+      "name": "contourTraceSelfTest",
+      "line": 447
+     }
+    ]
+   },
+   {
+    "path": "curve/curve_eval.cpp",
+    "title": "Curve evaluation: de Casteljau, de Boor, Yuksel C2 splines",
+    "language": "cpp",
+    "why": "Bezier of any degree, clamped and periodic uniform B-splines, and the Yuksel class of C2 interpolating splines (parabolic, circular, elliptical, hybrid bases) sampled to polylines. The chord-length node u_i is solved per triplet by bisection on a cubic, and all bases share that one node so Hybrid joins keep collinear tangents.",
+    "highlights": [
+     {
+      "start": 126,
+      "end": 147,
+      "caption": "Periodic de Boor: uniform knots U[i]=i, control indices mod n, parameter shifted by d into the valid window; denominator is the constant d-r+1"
+     },
+     {
+      "start": 209,
+      "end": 236,
+      "caption": "Yuksel t_i: cubic in the inter-point distances has f(0)<=0, f(1)>=0, so 40-step bisection always brackets the chord-length node; clamped away from 0 and 1"
+     },
+     {
+      "start": 257,
+      "end": 294,
+      "caption": "Circumcircle base: centre from the 2x2 solve, angles unwrapped in triangle orientation, quadratic alpha(s) through three nodes, monotonic-angle guard drops to the parabola"
+     },
+     {
+      "start": 500,
+      "end": 536,
+      "caption": "Segment blend C(t)=cos^2 F_j(second half) + sin^2 F_{j+1}(first half); open ends use the single available interpolant"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "deCasteljau",
+      "line": 86
+     },
+     {
+      "name": "deBoorClamped",
+      "line": 106
+     },
+     {
+      "name": "deBoorPeriodic",
+      "line": 128
+     },
+     {
+      "name": "solveYukselTi",
+      "line": 217
+     },
+     {
+      "name": "buildFit",
+      "line": 238
+     },
+     {
+      "name": "evalSeg",
+      "line": 335
+     },
+     {
+      "name": "sampleCurve",
+      "line": 406
+     },
+     {
+      "name": "sampleCurveBaseWeights",
+      "line": 543
+     }
+    ]
+   },
+   {
+    "path": "render/shape_geometry.cpp",
+    "title": "Shape geometry: flattening, fill rules, stroke tessellation",
+    "language": "cpp",
+    "why": "GL-free geometry for the stencil renderer: path flattening with quad-to-cubic elevation and chord-bounded subdivision, non-zero / even-odd point classification, round-stroke tessellation as a Minkowski band plus per-vertex discs, gradient sampling and feather sigma. Uses the Rive runtime's path and matrix types.",
+    "highlights": [
+     {
+      "start": 21,
+      "end": 44,
+      "caption": "Cubic flattening: step count from control-polygon length over maxSegmentPx, clamped to [1,256]; Bernstein evaluation in place"
+     },
+     {
+      "start": 129,
+      "end": 158,
+      "caption": "Point classification by a +x ray: signed crossings for non-zero winding, raw crossing parity for even-odd, one loop serves both rules"
+     },
+     {
+      "start": 205,
+      "end": 240,
+      "caption": "Round stroke as Minkowski sum: one band quad per segment plus a disc per vertex; output size computed exactly up front so reserve() removes reallocations"
+     },
+     {
+      "start": 242,
+      "end": 281,
+      "caption": "Disc fan trig table filled at static-init by the same libm calls, nine entries not eight, so the LUT is byte-identical to the inline version"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "cubicSteps",
+      "line": 22
+     },
+     {
+      "name": "appendCubic",
+      "line": 31
+     },
+     {
+      "name": "flattenPath",
+      "line": 49
+     },
+     {
+      "name": "classifyFill",
+      "line": 129
+     },
+     {
+      "name": "sampleGradient",
+      "line": 180
+     },
+     {
+      "name": "tessellateStroke",
+      "line": 205
+     }
+    ]
+   },
+   {
+    "path": "render/gl_shape_renderer.cpp",
+    "title": "GL stencil-then-cover renderer with analytic feather and tile cache",
+    "language": "cpp",
+    "why": "Stencil bit-7 clip-mask intersection with per-layer winding (INCR_WRAP/DECR_WRAP for non-zero, INVERT for even-odd), a scissored all-zero-stencil invariant between draws, analytic feather as seed -> jump-flood SDF -> erf coverage with a bounded flood schedule, and a content-hashed (FNV-1a over contours, clips and parameters) LRU tile cache with in-frame pinning and byte-identical replay via glBlitFramebuffer.",
+    "highlights": [
+     {
+      "start": 373,
+      "end": 398,
+      "caption": "Clip intersection per layer: winding fans scissored to the bbox, bit7 cleared where winding==0 (EQUAL 0x00 masked 0x7F -> REPLACE 0x80), winding bits cleared before the next layer"
+     },
+     {
+      "start": 421,
+      "end": 455,
+      "caption": "Winding pass gated to bit7: INCR_WRAP front / DECR_WRAP back for non-zero, INVERT for even-odd; cover test NOTEQUAL 0x00 vs EQUAL 0x01 on bit 0"
+     },
+     {
+      "start": 703,
+      "end": 741,
+      "caption": "Jump-flood ping-pong from max(boxW,boxH)/2; bounded mode halves the start down to the smallest step above 3*featherRadius, a suffix of the full schedule"
+     },
+     {
+      "start": 875,
+      "end": 908,
+      "caption": "Cache decision: FNV key plus structural tiebreak; hit replays the tile, key collision drops the stale tile, miss computes coverage then stores the box crop"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "buildClipMask",
+      "line": 319
+     },
+     {
+      "name": "windingPass",
+      "line": 422
+     },
+     {
+      "name": "coverStencil",
+      "line": 446
+     },
+     {
+      "name": "featherAnalytic",
+      "line": 654
+     },
+     {
+      "name": "ensureFeatherCoverage",
+      "line": 803
+     },
+     {
+      "name": "featherStore",
+      "line": 912
+     },
+     {
+      "name": "featherHitReplay",
+      "line": 989
+     },
+     {
+      "name": "GlShapePipeline::fillSolid",
+      "line": 1551
+     }
+    ]
+   },
+   {
+    "path": "lab3d/caustic_solver.hpp",
+    "title": "Caustic solver: meridian ray fan through a glass sphere",
+    "language": "cpp",
+    "why": "Exact meridian ray-fan optics for a point light through a glass sphere: Snell with TIR/graze classification, optical-vs-geometric clocks, wavefronts split at folds (sign change of the turning cross product), the rim caustic as the envelope of adjacent-ray crossings plus a separate axial focus segment, closed-form intersection circles, revolve-to-3D, and clipping by box and sphere shadow. Double inside, float at the API edge, scale-relative thresholds.",
+    "highlights": [
+     {
+      "start": 53,
+      "end": 90,
+      "caption": "One meridian ray: entry root of the sphere quadratic, refract at eta=1/n, exit chord s2=-2 g.(e1-C), refract out at eta=n; Miss/TIR/Graze classified, optical time n*s2 inside"
+     },
+     {
+      "start": 172,
+      "end": 201,
+      "caption": "Wavefront at time t split into branches where the turning cross product changes sign (relative cutoff 1e-9); the hinge point is shared between branches"
+     },
+     {
+      "start": 204,
+      "end": 240,
+      "caption": "Rim caustic as envelope: 2D line crossing of adjacent exit rays with both parameters >= 0, parallel test relative to |a||b|, theta-ordered loci"
+     },
+     {
+      "start": 242,
+      "end": 272,
+      "caption": "Axial focus segment: axis intercept a = exit.a - exit.r*dir.a/dir.r for rays with dir.r<0, forward intercepts only (exit.r>0), span returned as [min,max]"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "traceMeridianRay",
+      "line": 56
+     },
+     {
+      "name": "traceMeridianFan",
+      "line": 95
+     },
+     {
+      "name": "wavefrontAt",
+      "line": 160
+     },
+     {
+      "name": "rayPairCrossing",
+      "line": 207
+     },
+     {
+      "name": "causticEnvelope",
+      "line": 229
+     },
+     {
+      "name": "causticAxial",
+      "line": 252
+     },
+     {
+      "name": "segmentBlockedBySphere",
+      "line": 510
+     },
+     {
+      "name": "clipPolylineBySphereShadow",
+      "line": 534
+     }
+    ]
+   },
+   {
+    "path": "lab3d/primitive_project.hpp",
+    "title": "Primitive projection: sphere silhouette ellipse and moment-fit disk",
+    "language": "cpp",
+    "why": "Closed-form perspective projection of primitives to screen conics: the sphere silhouette ellipse derived from the tangent cone (xi0 = sin b cos b / A, semi-axes sin a cos a / A and sin a / sqrt(A), A = cos^2 a - sin^2 b), and a moment-fit ellipse for perspective disks via centroid and 2x2 covariance eigen-decomposition, exact in the affine limit.",
+    "highlights": [
+     {
+      "start": 91,
+      "end": 120,
+      "caption": "Tangent-cone derivation: rotate the image plane so the axis lies in the xi-z plane, complete the square with A = cos^2 a - sin^2 b, read off centre offset and semi-axes"
+     },
+     {
+      "start": 121,
+      "end": 152,
+      "caption": "projectSpherePersp: direction cosines of the cone axis, A > 0 and az > 0 validity gates, focalPx read from proj.m[5], sin b cancels in the centre so on-axis is regular"
+     },
+     {
+      "start": 177,
+      "end": 207,
+      "caption": "Moment-fit disk: 16 rim samples through the true projection, centroid and covariance, eigenvalues tr/2 +- sqrt(hd^2 + cxy^2), axes sqrt(2*lambda), rot = atan2(2cxy, cxx-cyy)/2"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "projectDisk",
+      "line": 30
+     },
+     {
+      "name": "projectSpherePersp",
+      "line": 121
+     },
+     {
+      "name": "projectDiskPersp",
+      "line": 167
+     },
+     {
+      "name": "projectConeTrianglePersp",
+      "line": 229
+     }
+    ]
+   },
+   {
+    "path": "scene3d/scene3d_occlusion.cpp",
+    "title": "Occlusion stage: clip-path, split and analytic visibility",
+    "language": "cpp",
+    "why": "A pluggable occlusion stage (none -> clip path -> z-buffer -> split -> analytic) that makes painter-order export order-independent: Sutherland-Hodgman clipping to a convex window, union of convex polygons by edge classification with loop chaining through a quantized endpoint map, true ray depth per pixel, and a plane-plane split line for mutually overlapping faces. The stored union is k-independent so even-odd and non-zero consumers realise the same region.",
+    "highlights": [
+     {
+      "start": 111,
+      "end": 143,
+      "caption": "Sutherland-Hodgman against a convex window: winding sign normalised once, per-edge side tests with a 1e-6 tolerance, intersection by the sp/(sp-sq) parameter"
+     },
+     {
+      "start": 184,
+      "end": 221,
+      "caption": "Union by edge classification: each edge split at crossings with every other polygon, sub-edge kept iff its midpoint is not strictly inside any other polygon"
+     },
+     {
+      "start": 299,
+      "end": 319,
+      "caption": "Front/back by true 3D ray depth: cast through overlap-AABB centre then the two centroids, compare surfaceT hits; painter-by-centre only as fallback"
+     },
+     {
+      "start": 343,
+      "end": 382,
+      "caption": "Per-drawable subtraction: nearer silhouettes clipped into D, unioned, then stored reversed so nonZero fill of D-outer + loops equals D minus union under both rules"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "clipToConvex",
+      "line": 111
+     },
+     {
+      "name": "unionConvexPolys",
+      "line": 167
+     },
+     {
+      "name": "nInFrontOfD",
+      "line": 303
+     },
+     {
+      "name": "applyClipPath",
+      "line": 322
+     },
+     {
+      "name": "planePlaneLine",
+      "line": 420
+     },
+     {
+      "name": "depthFlip",
+      "line": 484
+     },
+     {
+      "name": "applySplit",
+      "line": 534
+     },
+     {
+      "name": "applyAnalytic",
+      "line": 719
+     },
+     {
+      "name": "applyOcclusion",
+      "line": 865
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "section": "04-shaderweave",
+  "files": [
+   {
+    "path": "CodeNodeRuntime.cpp",
+    "title": "CUDA and OptiX node runtimes behind PImpl",
+    "language": "cpp",
+    "why": "Two PImpl-isolated runtimes: NVRTC compiles wrapped user source to PTX and loads it with cuModuleLoadDataEx into a CUDA/GL PBO, and the OptiX side maps a GL input texture into a cudaTextureObject_t each frame. Every driver call is if-init checked and unwound into a readable last_error, and a live-edited project kernel can shadow the saved one.",
+    "highlights": [
+     {
+      "start": 226,
+      "end": 239,
+      "caption": "process_code wraps user source between the injected Uniforms header and the mainImageKernel footer, adding a default mainImage when none is defined"
+     },
+     {
+      "start": 281,
+      "end": 315,
+      "caption": "PTX pulled from NVRTC, old module unloaded, cuModuleLoadDataEx and cuModuleGetFunction each guarded by an if-init CUresult check that fills error_out"
+     },
+     {
+      "start": 655,
+      "end": 691,
+      "caption": "render picks the live-edited project kernel over the saved one, maps the registered PBO for CUDA, launches, unmaps, then glTexSubImage2D from the PBO"
+     },
+     {
+      "start": 927,
+      "end": 964,
+      "caption": "map_input_texture: GL texture -> cudaGraphicsMapResources -> cudaArray -> cudaCreateTextureObject, unmapping on every failure path"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "CudaBridge::init_cuda",
+      "line": 133
+     },
+     {
+      "name": "CudaBridge::Kernel::compile",
+      "line": 241
+     },
+     {
+      "name": "CudaBridge::Kernel::launch",
+      "line": 317
+     },
+     {
+      "name": "CudaBridge::GLTexture::init",
+      "line": 400
+     },
+     {
+      "name": "CUDA_Node_Runtime::render",
+      "line": 649
+     },
+     {
+      "name": "OptiX_Node_Runtime::Impl::map_input_texture",
+      "line": 917
+     },
+     {
+      "name": "OptiX_Node_Runtime::Impl::build_pipeline",
+      "line": 994
+     },
+     {
+      "name": "OptiX_Node_Runtime::render",
+      "line": 1080
+     }
+    ]
+   },
+   {
+    "path": "NodeGraph.hpp",
+    "title": "Pull-based graph evaluation and source-derived sockets",
+    "language": "cpp",
+    "why": "render_dependency_texture pulls upstream nodes recursively with a visiting set for cycle detection and ping-pongs two render targets when a node feeds itself. Sockets are parsed out of the shader source (iChannelN, sampler/image declarations, writeonly -> output) and rebuilt with their pin ids preserved so links survive an edit; recompilation is gated on a per-node revision counter.",
+    "highlights": [
+     {
+      "start": 522,
+      "end": 560,
+      "caption": "declaration scan: last token is the uniform name, writeonly images become output sockets, other samplers/images take the next free texture unit"
+     },
+     {
+      "start": 592,
+      "end": 624,
+      "caption": "rebuild_sockets keeps old pin ids keyed by socket name so re-parsing after an edit does not break existing links"
+     },
+     {
+      "start": 1383,
+      "end": 1420,
+      "caption": "bind_shader_inputs resolves each linked input by rendering the upstream node recursively; a self-link reads the current output, unseeded feedback reads nothing"
+     },
+     {
+      "start": 1448,
+      "end": 1482,
+      "caption": "visiting-set guard around the draw, write target chosen by feedback_flip, flip and mark seeded after drawing so the next read hits the other buffer"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "extract_named_texture_sockets",
+      "line": 465
+     },
+     {
+      "name": "rebuild_sockets",
+      "line": 592
+     },
+     {
+      "name": "refresh_node",
+      "line": 647
+     },
+     {
+      "name": "spawn_code_node",
+      "line": 663
+     },
+     {
+      "name": "connect",
+      "line": 895
+     },
+     {
+      "name": "ensure_shader_preview_compiled",
+      "line": 1062
+     },
+     {
+      "name": "bind_shader_inputs",
+      "line": 1364
+     },
+     {
+      "name": "render_dependency_texture",
+      "line": 1423
+     }
+    ]
+   },
+   {
+    "path": "LegacyNodeGraphActivity.hpp",
+    "title": "Render plan from union-find components",
+    "language": "cpp",
+    "why": "A path-compressed, union-by-rank disjoint set groups nodes into components; the component containing the projected node becomes the active set and a post-order DFS over input links yields a dependency-ordered render list that terminates on feedback cycles. The plan is memoised on (graph_revision, projected_node, preview_revision) so the O(N+E) rebuild runs only on topology change.",
+    "highlights": [
+     {
+      "start": 18,
+      "end": 45,
+      "caption": "find with path compression and unite by rank, node ids stored in maps so ids need not be dense"
+     },
+     {
+      "start": 48,
+      "end": 76,
+      "caption": "post-order DFS over connected input pins; the visited set terminates feedback cycles and emits dependencies before dependents"
+     },
+     {
+      "start": 112,
+      "end": 137,
+      "caption": "static CachedRenderPlan keyed on graph_revision, projected node id and transient preview revision; a hit returns copies without rebuilding"
+     },
+     {
+      "start": 143,
+      "end": 172,
+      "caption": "nodes added, links unioned, active roots seeded from the projected node plus linked special nodes, then every node filtered by its root"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "DisjointSet::find",
+      "line": 18
+     },
+     {
+      "name": "DisjointSet::unite",
+      "line": 29
+     },
+     {
+      "name": "collect_render_dependencies",
+      "line": 48
+     },
+     {
+      "name": "activate_special_component",
+      "line": 78
+     },
+     {
+      "name": "build_active_render_plan",
+      "line": 107
+     },
+     {
+      "name": "refresh_special_node_outputs_for_current_frame",
+      "line": 214
+     }
+    ]
+   },
+   {
+    "path": "optix_related.hpp",
+    "title": "OptiX 7+ host bring-up",
+    "language": "cpp",
+    "why": "OptixModuleManager compiles NVRTC PTX into per-name cached modules, OptixPipelineBuilder creates program groups, links the pipeline, aggregates stack sizes and builds aligned SBT records, and OptixContextManager discovers the driver context with a runtime fallback. The device-side prelude injected before user code lives in OPTIX_PROGRAM_HEADER.",
+    "highlights": [
+     {
+      "start": 199,
+      "end": 229,
+      "caption": "createModule replaces any cached module of the same name and calls optixModuleCreate with the shared compile options, surfacing the log on failure"
+     },
+     {
+      "start": 390,
+      "end": 416,
+      "caption": "per-group optixProgramGroupGetStackSize max-reduced, continuation stack = cssRG + maxTraceDepth * max(cssCH, cssMS)"
+     },
+     {
+      "start": 418,
+      "end": 457,
+      "caption": "SBT records aligned to OPTIX_SBT_RECORD_ALIGNMENT, headers packed per program group, uploaded and wired into OptixShaderBindingTable"
+     },
+     {
+      "start": 506,
+      "end": 542,
+      "caption": "cuCtxGetCurrent first, cudaFree(0) only when no driver context is current, then optixInit and optixDeviceContextCreate with a log callback"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "OptixModuleManager::compileToPTX",
+      "line": 152
+     },
+     {
+      "name": "OptixModuleManager::createModule",
+      "line": 199
+     },
+     {
+      "name": "OptixPipelineBuilder::buildPipeline",
+      "line": 307
+     },
+     {
+      "name": "OptixPipelineBuilder::buildSBT",
+      "line": 418
+     },
+     {
+      "name": "OptixPipelineBuilder::launch",
+      "line": 460
+     },
+     {
+      "name": "OptixContextManager::init",
+      "line": 506
+     },
+     {
+      "name": "OPTIX_RT::load_optix_programs",
+      "line": 740
+     }
+    ]
+   },
+   {
+    "path": "cuda_related.hpp",
+    "title": "Runtime-API CUDA kernel, GL interop and cuFFT",
+    "language": "cpp",
+    "why": "The runtime-API counterpart to CodeNodeRuntime: CUDAKernel wraps NVRTC compilation and a Shadertoy-style launch, CUDAGLTexture registers a PBO for CUDA writes and copies it into a GL texture, and FFTConvolver holds C2C plans for convolution-based simulations.",
+    "highlights": [
+     {
+      "start": 139,
+      "end": 166,
+      "caption": "injected mainImageKernel footer: one thread per pixel, y flipped to GL convention, mainImage output clamped and packed to uchar4"
+     },
+     {
+      "start": 326,
+      "end": 363,
+      "caption": "launch mirrors the device Uniforms struct on the host and passes it by value through cuLaunchKernel's args pointer array with a 16x16 block grid"
+     },
+     {
+      "start": 431,
+      "end": 450,
+      "caption": "mapCUDA/unmapCUDA expose the registered PBO as a device pointer; updateTexture then copies PBO to texture with glTexSubImage2D"
+     },
+     {
+      "start": 702,
+      "end": 740,
+      "caption": "FFTConvolver allocates complex state, kernel FFT and temp buffers and creates forward/inverse cufftPlan2d C2C plans"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "CUDAKernel::processCode",
+      "line": 184
+     },
+     {
+      "name": "CUDAKernel::compile",
+      "line": 226
+     },
+     {
+      "name": "CUDAKernel::launch",
+      "line": 326
+     },
+     {
+      "name": "CUDAGLTexture::init",
+      "line": 396
+     },
+     {
+      "name": "CUDAGLTexture::mapCUDA",
+      "line": 431
+     },
+     {
+      "name": "initCUDA",
+      "line": 595
+     },
+     {
+      "name": "FFTConvolver::init",
+      "line": 702
+     }
+    ]
+   },
+   {
+    "path": "shader_related.hpp",
+    "title": "Reflection-driven uniforms and source patching",
+    "language": "cpp",
+    "why": "Uniforms are enumerated from GL_ACTIVE_UNIFORMS into a name -> meta map, values held in a std::variant and set through std::visit onto a static-overload UniformDispatcher gated by if constexpr with a static_assert on unsupported types. gen_missing_uniforms scans Shadertoy-style source and injects the declarations it omitted.",
+    "highlights": [
+     {
+      "start": 210,
+      "end": 228,
+      "caption": "add_all_from_program enumerates GL_ACTIVE_UNIFORMS and records name, location and GLenum type per uniform"
+     },
+     {
+      "start": 239,
+      "end": 276,
+      "caption": "UniformDispatcher static overloads per GLM type; set_uniform_using_loc gated by if constexpr with a static_assert on unsupported types"
+     },
+     {
+      "start": 278,
+      "end": 304,
+      "caption": "set_uniform stores the variant then std::visits it; the (unit, texture) pair binds the sampler, everything else forwards to the dispatcher"
+     },
+     {
+      "start": 382,
+      "end": 421,
+      "caption": "iChannelN usage found by regex, sampler type inferred from texture3D/textureCube calls, only undeclared names are prepended"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "uniform_map::add_all_from_program",
+      "line": 210
+     },
+     {
+      "name": "uniform_map::set_uniform_using_loc",
+      "line": 255
+     },
+     {
+      "name": "uniform_map::set_uniform",
+      "line": 278
+     },
+     {
+      "name": "Shader::gen_missing_uniforms",
+      "line": 356
+     },
+     {
+      "name": "Shader::_gen_missing_main",
+      "line": 428
+     },
+     {
+      "name": "Shader::_PrepShaderSource_split",
+      "line": 491
+     },
+     {
+      "name": "Shader::compileShader",
+      "line": 630
+     },
+     {
+      "name": "Shader::compile_program",
+      "line": 668
+     }
+    ]
+   },
+   {
+    "path": "progressive_pt.cu",
+    "title": "SDF path tracer in one raygen program",
+    "language": "cuda",
+    "why": "A compact sphere-traced path tracer: TEA-hash RNG, cosine hemisphere sampling, diffuse / rough-metal / dielectric lobes with Schlick and total internal reflection, Russian roulette, thin-lens depth of field, motion blur, running-mean accumulation and ACES tone mapping, all inside __raygen__main.",
+    "highlights": [
+     {
+      "start": 5,
+      "end": 18,
+      "caption": "TEA hash with four rounds seeded per pixel and frame; rnd rehashes the seed and takes the low 24 bits"
+     },
+     {
+      "start": 111,
+      "end": 132,
+      "caption": "cosine-weighted hemisphere sample (cos theta = sqrt(r2)) in a tangent frame, plus Schlick Fresnel from the IOR"
+     },
+     {
+      "start": 166,
+      "end": 201,
+      "caption": "diffuse, rough-metal (perturbed mirror, rejected below the surface) and dielectric lobes; k < 0 gives TIR, otherwise Fresnel picks reflect or refract"
+     },
+     {
+      "start": 229,
+      "end": 261,
+      "caption": "thin-lens DOF via focal point and sqrt-radius aperture disc, per-sample time jitter for motion blur, running mean against the linearised previous frame"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "tea",
+      "line": 5
+     },
+     {
+      "name": "rnd",
+      "line": 15
+     },
+     {
+      "name": "sceneSDF",
+      "line": 44
+     },
+     {
+      "name": "calcNormal",
+      "line": 98
+     },
+     {
+      "name": "sampleHemisphere",
+      "line": 112
+     },
+     {
+      "name": "fresnel",
+      "line": 128
+     },
+     {
+      "name": "pathTrace",
+      "line": 135
+     },
+     {
+      "name": "__raygen__main",
+      "line": 216
+     }
+    ]
+   },
+   {
+    "path": "FancyKnob.hpp",
+    "title": "Draw-list toggle built from ImGui internals",
+    "language": "cpp",
+    "why": "FancyKnob uses ButtonBehavior for interaction, ImGuiStorage for per-widget animation state and raw draw-list geometry for its rounded-rect rim, layered sphere shading and optional additive glow. The appearance is generated from geometry each frame, never from an image.",
+    "highlights": [
+     {
+      "start": 104,
+      "end": 137,
+      "caption": "clockwise rounded-rect polyline: four corner arcs and four subdivided edges that follow the exact silhouette"
+     },
+     {
+      "start": 512,
+      "end": 536,
+      "caption": "ItemSize/ItemAdd/ButtonBehavior for input, then an exponential approach t += (target - t) * clamp(dt * 14) persisted in ImGuiStorage"
+     },
+     {
+      "start": 627,
+      "end": 662,
+      "caption": "DrawColoredPath: neutral underlay stroke, then per-segment lines extended by 3/4 thickness, half-pixel snapped, hue ramped by arc length"
+     },
+     {
+      "start": 676,
+      "end": 696,
+      "caption": "glow rings with quadratic falloff; an ImDrawList callback switches GL blending to additive and ImDrawCallback_ResetRenderState restores it"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "BuildRoundedRectPolylineEqual",
+      "line": 56
+     },
+     {
+      "name": "BuildRoundedRectPolyline",
+      "line": 104
+     },
+     {
+      "name": "MyWidgets::FancyToggle",
+      "line": 142
+     },
+     {
+      "name": "MyWidgets::FancyTogglePlus",
+      "line": 311
+     },
+     {
+      "name": "MyWidgets::FancyKnob",
+      "line": 498
+     }
+    ]
+   },
+   {
+    "path": "Window_Editor.hpp",
+    "title": "Live-edit window over the graph",
+    "language": "cpp",
+    "why": "The editor window syncs its buffer to the selected node by id and revision, commits edits back through refresh_node, and in live mode projects the unsaved text as a temporary override that is dropped again when live edit is switched off. This is the UI end of the saved/project two-tier override in the runtimes.",
+    "highlights": [
+     {
+      "start": 91,
+      "end": 120,
+      "caption": "sync_from_selection reloads only when node id, revision or source differ, and applies a pending cross-node cursor jump after reload"
+     },
+     {
+      "start": 135,
+      "end": 170,
+      "caption": "commit_to_selected writes back through refresh_node; project_current_to_viewer instead projects the buffer as a temporary override"
+     },
+     {
+      "start": 188,
+      "end": 208,
+      "caption": "toggle_live_edit: enabling projects the buffer, disabling reverts to the saved source if an override is active"
+     },
+     {
+      "start": 447,
+      "end": 458,
+      "caption": "per frame, a changed buffer refreshes the processed preview and, in live mode, re-projects it as a temporary override"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "Editor_Window::sync_from_selection",
+      "line": 78
+     },
+     {
+      "name": "Editor_Window::commit_to_selected",
+      "line": 135
+     },
+     {
+      "name": "Editor_Window::project_current_to_viewer",
+      "line": 157
+     },
+     {
+      "name": "Editor_Window::toggle_live_edit",
+      "line": 188
+     },
+     {
+      "name": "Editor_Window::handle_bookmarks",
+      "line": 282
+     },
+     {
+      "name": "Editor_Window::draw_search_bar_line_highlight",
+      "line": 315
+     },
+     {
+      "name": "Editor_Window::render_editor",
+      "line": 416
+     }
+    ]
+   },
+   {
+    "path": "node-editor-fork.diff",
+    "title": "imgui-node-editor fork: traits at the BeginNode seam",
+    "language": "diff",
+    "why": "The public BeginNode gains a traits bitmask that NodeBuilder stores on each editor node; DrawBorder replaces the upstream single AddRect with a feathered, id-phased glow and, for the Ribbon trait, an animated perimeter ribbon sampled from the node's rounded-rect outline. Links also gain a pulsing tapered ribbon and a self-loop curve.",
+    "highlights": [
+     {
+      "start": 14,
+      "end": 39,
+      "caption": "BeginNode(NodeId, uint32_t traits) at the public API and the VisualTrait bitmask (Ribbon, Lightning, Fire, Glow, Rainbow) in the internal header"
+     },
+     {
+      "start": 769,
+      "end": 802,
+      "caption": "perimeter sampled by arc-length parameter, outward normals from central-difference tangents, a travelling bump plus wobble sets each outer point"
+     },
+     {
+      "start": 836,
+      "end": 875,
+      "caption": "DrawBorder: upstream AddRect replaced by ten feathered glow rects with an id-phased pulse, the main rect, then the Ribbon trait dispatch"
+     },
+     {
+      "start": 1277,
+      "end": 1297,
+      "caption": "NodeBuilder::Begin takes the traits and stores them on m_CurrentNode so DrawBorder can read them at draw time"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "BeginNode(NodeId, uint32_t traits) declaration",
+      "line": 19
+     },
+     {
+      "name": "enum VisualTrait",
+      "line": 31
+     },
+     {
+      "name": "ax::NodeEditor::BeginNode",
+      "line": 93
+     },
+     {
+      "name": "DrawCreatureRibbonBorderOutward",
+      "line": 761
+     },
+     {
+      "name": "ed::Node::DrawBorder",
+      "line": 834
+     },
+     {
+      "name": "DrawTaperedBezierWithPulse",
+      "line": 979
+     },
+     {
+      "name": "ed::Link::GetCurve",
+      "line": 1134
+     },
+     {
+      "name": "ed::NodeBuilder::Begin",
+      "line": 1282
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "section": "05-simulation",
+  "files": [
+   {
+    "path": "crucible/mpm_p2g.comp",
+    "title": "MLS-MPM P2G: constitutive dispatch and atomic scatter",
+    "language": "glsl",
+    "why": "The particle-to-grid kernel: APIC affine update, singular-value clamping, then a per-material constitutive branch (fixed-corotated, Stomakhin snow, Drucker-Prager sand, AnisoMPM damage, phase-field) before a 3x3 B-spline fixed-point atomic scatter. Also engineering under GL limits: texture-buffer LUTs and imageBuffer state to dodge the 16-SSBO cap, z-occupancy bit-packed into material ids for 2.5D.",
+    "highlights": [
+     {
+      "start": 509,
+      "end": 520,
+      "caption": "Closed-form spectral positive part of a symmetric 2x2: eigenpair from trace/discriminant, eigenvector via (S - e1 I)(b, e1 - a) = 0"
+     },
+     {
+      "start": 572,
+      "end": 600,
+      "caption": "AnisoMPM damage step: driving force Phi = (A s+):(s+ A)/sigma_c^2 with AT1 threshold, monotone D_tilde history in an imageBuffer, explicit eta d_dot = <(1-d)D - (d - l0^2 Lap d)> with a fixed-point rate clamp, g(d) = (1-d)^2(1-k)+k"
+     },
+     {
+      "start": 4614,
+      "end": 4648,
+      "caption": "Drucker-Prager return mapping on log singular values: hydrostatic/deviatoric split, tension collapses to zero strain, cone projection shrinks the deviator, Neo-Hookean stress on the projected F"
+     },
+     {
+      "start": 4745,
+      "end": 4768,
+      "caption": "Affine momentum (-dt V0 4/dx^2 stress + m C), then 3x3 B-spline scatter of mass, momentum and heat through int fixed-point atomicAdd with z_occ scaling the footprint but not the stiffness"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "main",
+      "line": 613
+     },
+     {
+      "name": "spectral_positive2",
+      "line": 511
+     },
+     {
+      "name": "aniso_damage_step",
+      "line": 527
+     },
+     {
+      "name": "porous_growth_stress",
+      "line": 605
+     },
+     {
+      "name": "resolve_fracture_profile",
+      "line": 501
+     },
+     {
+      "name": "resolve_thermal_coupling",
+      "line": 477
+     },
+     {
+      "name": "magnetic_drive_response_gate",
+      "line": 365
+     }
+    ]
+   },
+   {
+    "path": "crucible/mpm_grid_op.comp",
+    "title": "MPM grid stage: decode, reaction impulse, 2.5D support, SDF BCs",
+    "language": "glsl",
+    "why": "The grid pass between P2G and G2P: fixed-point decode to velocity, a once-only read-and-clear of the SPH-to-MPM reaction impulse placed before the empty-cell early-out (int32-wrap rationale in the comment), a bounded 2.5D overhang support model, then SDF normal-projection boundary conditions and a velocity clamp.",
+    "highlights": [
+     {
+      "start": 56,
+      "end": 91,
+      "caption": "Read-and-clear of the reaction impulse for every cell before the mass early-out (else the int32 accumulator wraps), momentum decode, and impulse/mass applied as dv with a one-cell-per-step clamp"
+     },
+     {
+      "start": 105,
+      "end": 140,
+      "caption": "2.5D overhang support: coverage of the row below and side neighbours, solid_gate * overhang * attach with attach requiring a denser anchor, gravity only ever scaled down, lateral cohesion toward the denser side"
+     },
+     {
+      "start": 173,
+      "end": 207,
+      "caption": "SDF boundary: central-difference normal from the distance texture, remove inward normal velocity with friction, hard stop outside the domain, grid-edge conditions, 3-cells-per-step clamp"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "main",
+      "line": 50
+     }
+    ]
+   },
+   {
+    "path": "crucible/mpm_damage_gather.comp",
+    "title": "Non-local damage Laplacian from the B-spline's second derivative",
+    "language": "glsl",
+    "why": "Second half of the non-local damage regularisation: evaluates Lap(d) at each particle from the weight-normalised damage grid using the quadratic B-spline's own second derivative (1, -2, 1), with a free-surface fallback. The comments record the stencil-centring bug (floor vs round) that put half the particles a node off.",
+    "highlights": [
+     {
+      "start": 3,
+      "end": 16,
+      "caption": "Why the Laplacian exists (crack width becomes l0, not particle spacing), the zero-latency scatter-gather-p2g ordering, and imageBuffer as a separate binding namespace from the 16-SSBO cap"
+     },
+     {
+      "start": 43,
+      "end": 53,
+      "caption": "Weight-normalised node damage num/den from fixed-point ints, falling back to the particle's own d at empty nodes so Lap(d) -> 0 at a free surface"
+     },
+     {
+      "start": 72,
+      "end": 96,
+      "caption": "LapN_i = N''(x)N(y) + N(x)N''(y) with N'' = (1,-2,1) over the same 3x3 support the scatter used; base = floor(cell_pos - 0.5) matches the scatter's centring"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "bspline_weights",
+      "line": 37
+     },
+     {
+      "name": "node_damage",
+      "line": 46
+     },
+     {
+      "name": "main",
+      "line": 55
+     }
+    ]
+   },
+   {
+    "path": "crucible/spatial_hash.cpp",
+    "title": "GPU neighbour search as a seven-step counting sort",
+    "language": "cpp",
+    "why": "Host-side orchestration of the SPH hash grid: hash and count, copy counts, three-pass work-efficient exclusive scan (block scan, scan of block sums, add-back), cell ends, then an atomic-offset scatter into sorted order. Every step is a compute dispatch separated by an SSBO barrier.",
+    "highlights": [
+     {
+      "start": 31,
+      "end": 64,
+      "caption": "Three-pass Blelloch exclusive scan: per-block local scan with block totals, a single-workgroup scan of the totals, then add-back of block offsets"
+     },
+     {
+      "start": 66,
+      "end": 93,
+      "caption": "Steps 1-4: clear counts, hash-and-count dispatch, copy counts aside for cell_end, exclusive prefix sum converts counts to starts"
+     },
+     {
+      "start": 95,
+      "end": 120,
+      "caption": "Steps 5-7: cell_end = start + count, counts cleared and reused as per-cell atomic write offsets, scatter into sorted order"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "init",
+      "line": 9
+     },
+     {
+      "name": "exclusive_prefix_sum",
+      "line": 31
+     },
+     {
+      "name": "build",
+      "line": 66
+     },
+     {
+      "name": "bind",
+      "line": 122
+     }
+    ]
+   },
+   {
+    "path": "crucible/sph_force.comp",
+    "title": "SPH force, coupling and sphere-traced collision",
+    "language": "glsl",
+    "why": "One kernel does the whole SPH step over the hash: symmetric pressure gradient, Monaghan viscosity, XSPH, CSF surface tension with a separate immiscible-interface channel, reciprocal thermal mixing, a passive SPH-MPM contact model with a Newton's-third-law reaction written to an image, then an SDF sphere-tracing continuous-collision integrate. Sits at exactly 16 std430 blocks.",
+    "highlights": [
+     {
+      "start": 452,
+      "end": 480,
+      "caption": "Symmetric pressure gradient m_j (p_i/rho_i^2 + p_j/rho_j^2) dW, Monaghan artificial viscosity gated on approaching pairs, XSPH correction, SPH curl and divergence estimates"
+     },
+     {
+      "start": 482,
+      "end": 512,
+      "caption": "CSF colour-field gradient and Laplacian (lap W ~ 2(d+2)/h^2 (W - W0)) split into bulk and immiscible-interface channels, interface repulsion, and a rho-bar symmetric thermal weight so heat flow is equal and opposite"
+     },
+     {
+      "start": 661,
+      "end": 691,
+      "caption": "Coupling v2: reaction impulse -m a dt stored to an imageBuffer (separate binding namespace), dt-based depenetration instead of per-frame, restitution k = 1 + e clamped so resting contact cannot inject energy"
+     },
+     {
+      "start": 735,
+      "end": 773,
+      "caption": "SDF sphere-tracing CCD: advance by min(d - skin, rem), on hit snap to skin, reflect normal velocity, apply tangential friction, re-aim the unspent remainder and continue"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "eos_pressure",
+      "line": 125
+     },
+     {
+      "name": "immiscibility_pair",
+      "line": 160
+     },
+     {
+      "name": "fluid_props",
+      "line": 168
+     },
+     {
+      "name": "query_sdf",
+      "line": 243
+     },
+     {
+      "name": "sdf_normal",
+      "line": 249
+     },
+     {
+      "name": "sample_sdf_contact_temp",
+      "line": 258
+     },
+     {
+      "name": "query_mpm_mass",
+      "line": 306
+     },
+     {
+      "name": "main",
+      "line": 314
+     }
+    ]
+   },
+   {
+    "path": "crucible/sph_codim_detect.comp",
+    "title": "Codimensional detection: a small PCA per particle",
+    "language": "glsl",
+    "why": "Kernel-weighted covariance of neighbour offsets, closed-form 2x2 eigen-decomposition, eigenvalue ratio as a thread-vs-bulk classifier and the principal eigenvector as the local tangent, all in one pass over the hash grid.",
+    "highlights": [
+     {
+      "start": 37,
+      "end": 68,
+      "caption": "Accumulate C = sum w_j (x_j - x_i)(x_j - x_i)^T over the 3x3 hash cells with the cubic kernel as weight"
+     },
+     {
+      "start": 73,
+      "end": 102,
+      "caption": "Eigenvalues from trace and determinant, lambda2/lambda1 as dimensionality ratio, principal eigenvector (lambda1 - cyy, cxy), kernel scale ramps toward 2 below the threshold"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "main",
+      "line": 30
+     }
+    ]
+   },
+   {
+    "path": "crucible/shock_front.cpp",
+    "title": "Blast fronts: Sedov-Taylor radius, vent detection, one-hit guard",
+    "language": "cpp",
+    "why": "Fronts advance on the analytic 2D Sedov-Taylor law r = xi (E t^2 / rho0)^(1/4) with a derived hand-off to constant acoustic speed, retire by overpressure decay, spawn from flood-filled clusters of newly opened vents with hysteresis, and a persistent per-particle guard buffer guarantees one impulse per front.",
+    "highlights": [
+     {
+      "start": 54,
+      "end": 65,
+      "caption": "Per-particle guard seeded to the front id via glClearNamedBufferSubData so the particle pass can apply each front at most once"
+     },
+     {
+      "start": 86,
+      "end": 118,
+      "caption": "Vent detection: flag cells that went sealed->open while holding pressure (hysteresis), then a 4-neighbour stack flood fill accumulating centroid and stored pressure per cluster"
+     },
+     {
+      "start": 139,
+      "end": 161,
+      "caption": "Spawn cone fronts from the top clusters: aperture direction from the outside-field gradient, origin 1.5 cells outside, energy k_vent * sumP * cell_area, impulse-only so the cavity heat has a single owner"
+     },
+     {
+      "start": 185,
+      "end": 215,
+      "caption": "Sedov-Taylor r = k sqrt(t) with k = xi (E/rho0)^(1/4); solve D = k/(2 sqrt t) = c0 for t_trans, coast at c0 after; retire when k_p E / r^2 falls below a useful push"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "init",
+      "line": 13
+     },
+     {
+      "name": "spawn",
+      "line": 27
+     },
+     {
+      "name": "seed_guard",
+      "line": 54
+     },
+     {
+      "name": "detect_vent_fronts",
+      "line": 67
+     },
+     {
+      "name": "update",
+      "line": 185
+     },
+     {
+      "name": "radius_of",
+      "line": 230
+     },
+     {
+      "name": "dispatch_source",
+      "line": 238
+     },
+     {
+      "name": "dispatch_particles",
+      "line": 287
+     }
+    ]
+   },
+   {
+    "path": "modal2d/element_shell.cpp",
+    "title": "Marguerre shallow-shell triangle: composition and coupling",
+    "language": "cpp",
+    "why": "A 15-DOF shell element assembled from a CST membrane block and a DKT or Mindlin bending block through DOF scatter maps, plus the bending-stretching coupling K_mb = Bm^T Dm Sz Gw and the K_bb_extra term whose absence lets curved modes fall below flat-plate modes. Block-diagonal at zero curvature by the early return, linear in curvature through Sz.",
+    "highlights": [
+     {
+      "start": 18,
+      "end": 57,
+      "caption": "Membrane (CST) and bending (DKT thin / Mindlin thick) element matrices scattered into the interleaved (ux, uy, w, tx, ty) ordering via kCstToShell / kDktToShell"
+     },
+     {
+      "start": 59,
+      "end": 90,
+      "caption": "Derivation: linear z(x,y) gives constant dz/dx, dz/dy from CST gradients; Marguerre strain gains eps += grad z * grad w, written as Sz grad_w; K_mb = integral Bm^T Dm Sz Gw"
+     },
+     {
+      "start": 147,
+      "end": 177,
+      "caption": "Sz (3x2), Gw (2x9, w DOFs only), constant integrand so K_mb = (Bm^T Dm Sz Gw) * area via an explicit five-index loop"
+     },
+     {
+      "start": 179,
+      "end": 203,
+      "caption": "K_bb_extra = Gw^T (Sz^T Dm Sz) Gw * area: the membrane strain from pure transverse motion, needed so curvature stiffens rather than softens the shell"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "shell_element_matrices",
+      "line": 18
+     }
+    ]
+   },
+   {
+    "path": "modal2d/element_mindlin.cpp",
+    "title": "Mindlin-Reissner triangle with LSV shear stabilisation",
+    "language": "cpp",
+    "why": "A thick-plate triangle in 100 lines: constant-curvature bending from linear rotations, transverse shear integrated at three Gauss points with Lyly-Stenberg-Vihinen stabilisation h^2/(h^2 + alpha hK^2) against locking, and the rank argument for why pure DSG shear leaves a spurious zero-energy mode.",
+    "highlights": [
+     {
+      "start": 28,
+      "end": 41,
+      "caption": "Signed 2A, area-coordinate gradients b_i = dL_i/dx, c_i = dL_i/dy, and the flexural rigidity D = E h^3 / 12(1 - nu^2)"
+     },
+     {
+      "start": 43,
+      "end": 60,
+      "caption": "Bending B-matrix from beta = (theta_y, -theta_x): kappa_xx, kappa_yy, kappa_xy as linear combinations of rotation DOFs; Ke += A Bb^T Db Bb"
+     },
+     {
+      "start": 62,
+      "end": 90,
+      "caption": "Shear gamma = grad w + beta at 3 Gauss points (rank-sufficient, unlike rank-2 DSG), Ds = kappa G h * h^2/(h^2 + alpha hK^2) removes locking as h -> 0"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "plate_is_thick",
+      "line": 7
+     },
+     {
+      "name": "mindlin_element_matrices",
+      "line": 19
+     }
+    ]
+   },
+   {
+    "path": "modal2d/eigensolve_sparse.cpp",
+    "title": "Shift-invert Lanczos for K phi = lambda M phi",
+    "language": "cpp",
+    "why": "A generalized symmetric eigensolver written from scratch on Eigen with no ARPACK: SimplicialLDLT on K - sigma M, an M-orthonormal Krylov basis with full reorthogonalisation, lucky-breakdown restart with a random M-orthogonal vector, Ritz back-transform lambda = 1/mu + sigma, and regularisation of zero-stiffness/zero-mass DOFs so free-free structures factor.",
+    "highlights": [
+     {
+      "start": 25,
+      "end": 49,
+      "caption": "Regularise DOFs with both zero stiffness and zero mass by a 1e-10-relative diagonal, then LDLT-factor the shifted operator K - sigma M"
+     },
+     {
+      "start": 65,
+      "end": 104,
+      "caption": "Lanczos recurrence with OP = (K - sigma M)^-1 M: M-inner products for alpha, beta, full reorthogonalisation against V, and a random M-orthogonal restart on breakdown"
+     },
+     {
+      "start": 121,
+      "end": 142,
+      "caption": "Ritz values from the tridiagonal T; largest mu maps to smallest lambda = 1/mu + sigma; rigid-body modes filtered by omega threshold; Ritz vectors x = V S.col(i)"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "solve_sparse",
+      "line": 17
+     }
+    ]
+   },
+   {
+    "path": "modal2d/sustained_modal_voice.h",
+    "title": "Bowed, rubbed and blown modal synthesis in real time",
+    "language": "cpp",
+    "why": "Implicit-midpoint integration of mass-normalised modal ODEs with prewarped decay, a projected Gauss-Seidel sweep over up to 13 friction contacts sharing one body velocity, bracketed bisection of a regularised Stribeck stick/slip law cached in a 4097-entry LUT, and an explicit passivity bound so stationary contacts cannot pump energy. No allocation in render_add.",
+    "highlights": [
+     {
+      "start": 66,
+      "end": 86,
+      "caption": "Per-mode setup: bilinear prewarp w = 2 fs tan(pi f / fs), admittance 1/(2 zeta omega), decay warped by 1 + h^2 w^2/4 so low-damping decay rates survive near Nyquist, inv_d for the midpoint update"
+     },
+     {
+      "start": 105,
+      "end": 123,
+      "caption": "Stribeck/tanh friction (0.76 + 0.24 exp(-v^2/0.04)) tanh(v/0.012) tabulated once into 4097 floats, linearly interpolated, exact kinetic limit beyond the table"
+     },
+     {
+      "start": 299,
+      "end": 337,
+      "caption": "Midpoint predictor per mode, then two projected Gauss-Seidel sweeps: each bow solves f = limit * mu(v_bow - free_v - compliance f) by 16-step bisection and pushes its delta into the shared midpoint velocity"
+     },
+     {
+      "start": 338,
+      "end": 364,
+      "caption": "Passivity bound: body work split into linear and quadratic parts in the applied force; if body work exceeds work supplied by moving bows, scale the velocity increment down so stationary contacts cannot add energy"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "configure",
+      "line": 54
+     },
+     {
+      "name": "normalized_friction",
+      "line": 105
+     },
+     {
+      "name": "reset",
+      "line": 129
+     },
+     {
+      "name": "set_contact",
+      "line": 140
+     },
+     {
+      "name": "add_impulse",
+      "line": 193
+     },
+     {
+      "name": "add_pluck",
+      "line": 203
+     },
+     {
+      "name": "render_add",
+      "line": 230
+     },
+     {
+      "name": "measure_energy",
+      "line": 401
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "section": "06-light-transport-compact",
+  "files": [
+   {
+    "path": "bsdf.cpp",
+    "title": "GGX / AnisoGGX: visible-normal sampling with a lockstep pdf",
+    "language": "cpp",
+    "why": "Heitz 2018 VNDF half-vector sampling shared by isotropic and anisotropic GGX, so the estimator weight collapses to albedo·G1(ωi) ≤ albedo; the comments record the measured 21×/29.5× firefly weights that D-sampling produced. A standalone pdf() mirrors the sampler exactly because the integrator's MIS reads it.",
+    "highlights": [
+     {
+      "start": 61,
+      "end": 83,
+      "caption": "Heitz 2018 VNDF half-vector sampler in the stretched slope frame (stretch, warped disk, unstretch), shared by GGX and AnisoGGX"
+     },
+     {
+      "start": 182,
+      "end": 198,
+      "caption": "Why D·cos sampling was replaced: unbounded weight albedo·G·(ωo·h)/(cos_o·h·n), measured 29.5× at grazing; VNDF weight collapses to albedo·G1(ωi) ≤ albedo"
+     },
+     {
+      "start": 199,
+      "end": 229,
+      "caption": "AnisoGGX sample body: tangent frame, VNDF draw, reflect, exact pdf G1(ωo)·D/(4cos_o), weight albedo/(1+Λ(ωi))"
+     },
+     {
+      "start": 231,
+      "end": 246,
+      "caption": "Standalone pdf(AnisoGGX) recomputes the VNDF pdf from wo,wi so MIS in the integrator matches the sampler bit-for-bit"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "vndf_h_local",
+      "line": 65
+     },
+     {
+      "name": "sample(const GGX&)",
+      "line": 85
+     },
+     {
+      "name": "pdf(const GGX&)",
+      "line": 122
+     },
+     {
+      "name": "aniso_lambda",
+      "line": 176
+     },
+     {
+      "name": "sample(const AnisoGGX&)",
+      "line": 182
+     },
+     {
+      "name": "pdf(const AnisoGGX&)",
+      "line": 231
+     },
+     {
+      "name": "eval(const AnisoGGX&)",
+      "line": 248
+     },
+     {
+      "name": "sample(const Glass&)",
+      "line": 274
+     }
+    ]
+   },
+   {
+    "path": "integrator.h",
+    "title": "Volumetric path tracer with two-sided MIS and medium tracking",
+    "language": "cpp",
+    "why": "Path tracing with next-event estimation, power-heuristic MIS on both the light-sample and emitter-hit sides (distance accumulated across NullBSDF pass-throughs), std::optional<Medium> toggled at shell boundaries, medium events folded into throughput, and a shadow-ray walker that applies per-segment transmittance. Three estimator bugs are documented inline with the symptom each produced.",
+    "highlights": [
+     {
+      "start": 47,
+      "end": 77,
+      "caption": "Medium event weight already contains transmittance (double-attenuation bug); in-scatter vertices do no NEE so the next emitter hit is credited in full"
+     },
+     {
+      "start": 95,
+      "end": 127,
+      "caption": "NullBSDF shell toggles current_medium via rec.front_face and accumulates distance; emitter-hit MIS uses d_total²/(cos_l·A·n_lights) against prev_pdf"
+     },
+     {
+      "start": 171,
+      "end": 193,
+      "caption": "Light-sample side: transmittance-weighted visibility, f·Le·cos/p_light, power heuristic against pdf_material for the same direction"
+     },
+     {
+      "start": 196,
+      "end": 227,
+      "caption": "Shadow-ray walker through NullBSDF shells: per-segment transmittance, medium swap at each boundary, zero at first real occluder"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "power_heuristic",
+      "line": 17
+     },
+     {
+      "name": "PathIntegrator::trace",
+      "line": 27
+     },
+     {
+      "name": "PathIntegrator::sample_light",
+      "line": 156
+     },
+     {
+      "name": "PathIntegrator::shadow_transmittance",
+      "line": 205
+     }
+    ]
+   },
+   {
+    "path": "medium.cpp",
+    "title": "Homogeneous and Perlin media: free flight, delta and ratio tracking",
+    "language": "cpp",
+    "why": "Homogeneous free-flight sampling from the luminance pdf with a spectral weight correction for chromatic media; delta (Woodcock) tracking against an exact majorant derived from the clamped density range; ratio tracking for unbiased shadow transmittance; Henyey–Greenstein phase sampling.",
+    "highlights": [
+     {
+      "start": 29,
+      "end": 58,
+      "caption": "Free flight drawn from the luminance pdf; weight = σs·e^{-σt t}/pdf (or e^{-σt t_max}/P(escape)) so chromatic media stay unbiased, grey media reduce to albedo and 1"
+     },
+     {
+      "start": 68,
+      "end": 83,
+      "caption": "Density clamped to [0, density_mult] by construction, so the majorant σ̄t = lum(σa+σs)·density_mult is exact rather than estimated"
+     },
+     {
+      "start": 96,
+      "end": 126,
+      "caption": "Delta tracking loop: exponential steps against the majorant, accept with σt(p)/σ̄t, attenuation carried by the real-collision rate, weight = local albedo"
+     },
+     {
+      "start": 134,
+      "end": 154,
+      "caption": "Ratio tracking: multiply (1 − σt/σ̄t) at each candidate instead of terminating, unbiased Tr for a spatially varying field"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "sample_interaction(const HomogeneousMedium&)",
+      "line": 29
+     },
+     {
+      "name": "density_at",
+      "line": 68
+     },
+     {
+      "name": "majorant_sigma_t",
+      "line": 81
+     },
+     {
+      "name": "sample_interaction(const PerlinMedium&)",
+      "line": 85
+     },
+     {
+      "name": "transmittance(const PerlinMedium&)",
+      "line": 134
+     },
+     {
+      "name": "sample_hg",
+      "line": 159
+     }
+    ]
+   },
+   {
+    "path": "verify_bsdfs.cpp",
+    "title": "BSDF verification: slope-space quadrature, MC unbiasedness, pdf lockstep",
+    "language": "cpp",
+    "why": "Directional albedo by brute-force quadrature in half-vector slope space on a log-polar grid, with the measure chain dωi = 4(ωo·h) dωh, dωh = cos³ dxs dys, dxs dys = αx αy du dv written into the integrand, so an αy = 0.02 lobe integrates as reliably as a wide one. Monte-Carlo mean is checked against it at 4σ, max weight is asserted ≤ albedo, and bsdf::pdf is checked against the sampler's own pdf.",
+    "highlights": [
+     {
+      "start": 65,
+      "end": 94,
+      "caption": "Test plan T1/T2/T3 and the slope-space substitution u = x_s/αx that turns any GGX lobe into a unit bump; full measure chain stated"
+     },
+     {
+      "start": 96,
+      "end": 121,
+      "caption": "Log-polar quadrature in slope space: cell = r² dlnr dψ, integrand carries 4(ωo·h)·cos³θh·αxαy; the Jacobian chain is in the code"
+     },
+     {
+      "start": 144,
+      "end": 180,
+      "caption": "T1/T3 sweep over (0.45,0.02), (0.20,0.20), (0.05,0.50) at θo up to 80°, 4M draws, tolerance max(4σ, 1.5%), max weight ≤ albedo"
+     },
+     {
+      "start": 208,
+      "end": 240,
+      "caption": "pdf-lockstep: pdf_material must equal the sampler-reported pdf to 1e-9 on-support, since MIS weights are computed from the standalone function"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "aniso_albedo_bruteforce",
+      "line": 96
+     },
+     {
+      "name": "aniso_mc_weight",
+      "line": 125
+     },
+     {
+      "name": "test_aniso_unbiased_and_bounded",
+      "line": 144
+     },
+     {
+      "name": "test_aniso_isotropic_reduction",
+      "line": 182
+     },
+     {
+      "name": "test_pdf_matches_sampler",
+      "line": 208
+     },
+     {
+      "name": "test_ggx_vndf_unbiased_and_bounded",
+      "line": 242
+     },
+     {
+      "name": "main",
+      "line": 269
+     }
+    ]
+   },
+   {
+    "path": "verify_medium.cpp",
+    "title": "Medium verification against closed forms and a density integral",
+    "language": "cpp",
+    "why": "Homogeneous estimator identities (scatter weight σs/σt, escape weight 1, escape frequency e^{-σt t}) checked exactly; for the Perlin field, optical depth by a 20k-step reference sum so both ratio-tracking E[Tr] and delta-tracking escape rate must reproduce exp(−τ); a 200k-point sweep asserts the majorant dominates. The header records a stale-binary lesson: a verifier that no longer compiles keeps printing OK.",
+    "highlights": [
+     {
+      "start": 38,
+      "end": 63,
+      "caption": "Grey-medium identities asserted per draw: scatter weight == σs/σt, escape weight == 1, escape frequency == exp(−σt·t_max)"
+     },
+     {
+      "start": 86,
+      "end": 97,
+      "caption": "Reference optical depth: 20k-step midpoint Riemann sum of luminance(σt)·density_at along the ray"
+     },
+     {
+      "start": 99,
+      "end": 135,
+      "caption": "Ratio-tracking E[Tr] and delta-tracking escape rate both compared to exp(−τ_ref) on three rays, 60k draws, tolerance 0.01 (se < 0.0021)"
+     },
+     {
+      "start": 137,
+      "end": 155,
+      "caption": "Majorant domination sweep: 200k random points, max σt(p) must not exceed majorant_sigma_t"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "test_homogeneous_weights",
+      "line": 38
+     },
+     {
+      "name": "optical_depth_ref",
+      "line": 87
+     },
+     {
+      "name": "test_perlin_tracking_unbiased",
+      "line": 99
+     },
+     {
+      "name": "test_perlin_majorant_dominates",
+      "line": 137
+     },
+     {
+      "name": "main",
+      "line": 157
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "section": "07-geometry",
+  "files": [
+   {
+    "path": "fortune-cpp/arc_beachline.cpp",
+    "title": "Arc beachline: one threaded BST, five balance policies",
+    "language": "cpp",
+    "why": "One node type and one symmetric rotate() serve AVL, red-black, treap, splay and size-balanced variants; each node is a parabolic arc whose prev/next pointers give the neighbour triple in O(1), and the validator cross-checks in-order traversal against the threaded list.",
+    "highlights": [
+     {
+      "start": 104,
+      "end": 129,
+      "caption": "single side-parameterised rotate(): promote the opposite child, re-link the parent, refresh heights and subtree sizes up to the root"
+     },
+     {
+      "start": 277,
+      "end": 297,
+      "caption": "splay: zig-zig versus zig-zag chosen from two is_left_child booleans, no duplicated left/right code paths"
+     },
+     {
+      "start": 533,
+      "end": 559,
+      "caption": "split_arc reuses the node for the new site and threads two copies of the old arc around it, each inheriting one edge id"
+     },
+     {
+      "start": 673,
+      "end": 695,
+      "caption": "splay delete: bring the node to the root, splay its predecessor while still linked, unlink last so every rotation snapshot sees tree and thread agree"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "ArcBeachline::rotate",
+      "line": 104
+     },
+     {
+      "name": "ArcBeachline::rb_insert_fixup",
+      "line": 161
+     },
+     {
+      "name": "ArcBeachline::rb_delete_fixup",
+      "line": 207
+     },
+     {
+      "name": "ArcBeachline::sbt_maintain",
+      "line": 299
+     },
+     {
+      "name": "ArcBeachline::find_arc_above",
+      "line": 470
+     },
+     {
+      "name": "ArcBeachline::split_arc",
+      "line": 533
+     },
+     {
+      "name": "ArcBeachline::remove_arc",
+      "line": 561
+     },
+     {
+      "name": "ArcBeachline::validate",
+      "line": 788
+     }
+    ]
+   },
+   {
+    "path": "fortune-cpp/beachline.cpp",
+    "title": "Leaf beachline: arcs on leaves, breakpoints inside",
+    "language": "cpp",
+    "why": "The de Berg layout with AVL balance; each subtree caches its extreme leaves so a breakpoint's two defining sites are O(1) during descent, and split_arc assembles the 3-leaf/2-breakpoint subtree before replacing the old leaf in place.",
+    "highlights": [
+     {
+      "start": 95,
+      "end": 110,
+      "caption": "update_node: a leaf is its own extreme; a breakpoint inherits leftmost/rightmost leaf pointers from its two children"
+     },
+     {
+      "start": 221,
+      "end": 253,
+      "caption": "descent step: the breakpoint's defining sites come from child[0]->extreme[1] and child[1]->extreme[0], compared through the predicate kernel"
+     },
+     {
+      "start": 309,
+      "end": 331,
+      "caption": "split_arc builds left-copy, inserted and right-copy under two fresh breakpoints before touching the live tree"
+     },
+     {
+      "start": 429,
+      "end": 458,
+      "caption": "remove_arc: the sibling replaces the parent breakpoint; the other breakpoint survives as the new left|right boundary"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "Beachline::update_node",
+      "line": 95
+     },
+     {
+      "name": "Beachline::rotate",
+      "line": 126
+     },
+     {
+      "name": "Beachline::rebalance_from",
+      "line": 153
+     },
+     {
+      "name": "Beachline::find_arc_above",
+      "line": 197
+     },
+     {
+      "name": "Beachline::insert_adjacent",
+      "line": 257
+     },
+     {
+      "name": "Beachline::split_arc",
+      "line": 309
+     },
+     {
+      "name": "Beachline::remove_arc",
+      "line": 412
+     },
+     {
+      "name": "Beachline::validate",
+      "line": 601
+     }
+    ]
+   },
+   {
+    "path": "fortune-cpp/fortune_engine.cpp",
+    "title": "Fortune sweep: queue order and cocircular collapse",
+    "language": "cpp",
+    "why": "The event loop with a strict-weak-ordering comparator, lazy circle-event invalidation, same-y adjacent insertion, and a circle handler that collapses the whole run of arcs meeting at a degree-d vertex; the pre-fix behaviour is kept behind switches for A/B comparison.",
+    "highlights": [
+     {
+      "start": 246,
+      "end": 263,
+      "caption": "priority-queue comparator delegates to one canonical total order; the epsilon near() version is retained as the intransitive counterexample"
+     },
+     {
+      "start": 571,
+      "end": 610,
+      "caption": "circle event_y built as a LazyScalar: rational circumcentre, one radical, compared against the directrix without collapsing the formula"
+     },
+     {
+      "start": 895,
+      "end": 933,
+      "caption": "cocircular collapse: extend left and right from the vanishing arc while each neighbour's circumcentre coincides with the event vertex"
+     },
+     {
+      "start": 965,
+      "end": 991,
+      "caption": "remove the run as one unit and open exactly one SL|SR replacement edge starting at the shared vertex"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "FortuneEngine::QueueLess::operator()",
+      "line": 246
+     },
+     {
+      "name": "FortuneEngine::reset",
+      "line": 273
+     },
+     {
+      "name": "FortuneEngine::check_circle_event",
+      "line": 395
+     },
+     {
+      "name": "FortuneEngine::handle_site_event",
+      "line": 637
+     },
+     {
+      "name": "FortuneEngine::handle_circle_event",
+      "line": 803
+     },
+     {
+      "name": "FortuneEngine::step",
+      "line": 1001
+     },
+     {
+      "name": "FortuneEngine::raw_final_edges",
+      "line": 1083
+     },
+     {
+      "name": "FortuneEngine::capture",
+      "line": 1301
+     }
+    ]
+   },
+   {
+    "path": "fortune-cpp/geometry.cpp",
+    "title": "Numerical kernel: predicates, parabolas, edge finalisation",
+    "language": "cpp",
+    "why": "Scale-relative tolerance bands with an audit trail, relative-tolerance handling of the equal-y and near-linear parabola regimes, long-double circumcircle, vertex welding for cocircular clusters, and half-open bisector rays oriented by the third circumcircle site.",
+    "highlights": [
+     {
+      "start": 51,
+      "end": 88,
+      "caption": "resolve_sign: fast double sign outside the band, tie policy inside it, only an exact 0 reported as a tie; every path counted in the audit"
+     },
+     {
+      "start": 137,
+      "end": 167,
+      "caption": "parabola intersection: relative tolerance for equal-height foci and for a near-zero leading coefficient, falling back to the stable linear root"
+     },
+     {
+      "start": 290,
+      "end": 325,
+      "caption": "vertex welding: O(P^2) nearest-cluster pass over endpoints, then a second pass rewrites each endpoint to the stable representative"
+     },
+     {
+      "start": 461,
+      "end": 495,
+      "caption": "unfinished edges reconstructed from the site bisector; a half-open ray is shot away from the third circumcircle site"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "FortunePredicateKernel::resolve_sign",
+      "line": 51
+     },
+     {
+      "name": "FortunePredicateKernel::orientation_sign",
+      "line": 90
+     },
+     {
+      "name": "parabola_intersections",
+      "line": 127
+     },
+     {
+      "name": "choose_breakpoint_x",
+      "line": 186
+     },
+     {
+      "name": "circumcircle_from_sites",
+      "line": 216
+     },
+     {
+      "name": "weld_edge_vertices",
+      "line": 284
+     },
+     {
+      "name": "clip_segment_to_box",
+      "line": 383
+     },
+     {
+      "name": "finalize_edge_to_box",
+      "line": 441
+     }
+    ]
+   },
+   {
+    "path": "fortune-cpp/lazy_scalar.cpp",
+    "title": "LazyScalar: formula-preserving number with interval sign",
+    "language": "cpp",
+    "why": "A shared expression DAG over + - * / sqrt with lazily cached interval bounds; sign() materialises only when the double interval straddles zero, forced-comparison counters record provenance, and labelled composites collapse in the printed formula.",
+    "highlights": [
+     {
+      "start": 24,
+      "end": 40,
+      "caption": "DAG node: exact leaf payload, optional name and label, and a mutable interval cache carrying wide and forced flags"
+     },
+     {
+      "start": 74,
+      "end": 110,
+      "caption": "interval evaluation: refinement level selected by the wide flag, outward bounds for neg/add/sub, rounding pad applied to non-leaf nodes"
+     },
+     {
+      "start": 153,
+      "end": 176,
+      "caption": "interval_sign decides from the double interval and refines to long double only when it straddles zero; mark_forced records the peek down the DAG"
+     },
+     {
+      "start": 185,
+      "end": 207,
+      "caption": "label-collapsed rendering: a labelled composite prints its name, a depth budget elides the rest"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "evaluate",
+      "line": 77
+     },
+     {
+      "name": "interval_sign",
+      "line": 159
+     },
+     {
+      "name": "render",
+      "line": 185
+     },
+     {
+      "name": "LazyScalar::named",
+      "line": 258
+     },
+     {
+      "name": "LazyScalar::sign",
+      "line": 277
+     },
+     {
+      "name": "LazyScalar::compare",
+      "line": 283
+     },
+     {
+      "name": "LazyScalar::interval_width",
+      "line": 292
+     },
+     {
+      "name": "LazyScalar::with_label",
+      "line": 314
+     }
+    ]
+   },
+   {
+    "path": "fortune-cpp/apollonius_engine.cpp",
+    "title": "Apollonius vertices and weighted diagrams",
+    "language": "cpp",
+    "why": "The tangent-circle vertex reduces to a 2x2 linear system plus one quadratic; the diagram is built over all site triples with sampled visibility along pair curves (a direct construction, not Karavelas-Yvinec), alongside power-diagram and multiplicatively weighted variants.",
+    "highlights": [
+     {
+      "start": 28,
+      "end": 50,
+      "caption": "quadratic solved with sign-matched q = -(b + sign(b) sqrt(disc))/2, roots q/a and c/q, avoiding cancellation"
+     },
+     {
+      "start": 64,
+      "end": 97,
+      "caption": "vertex solve: subtracting tangency equations gives a 2x2 linear system in (x, d), leaving one quadratic in the common distance d"
+     },
+     {
+      "start": 157,
+      "end": 189,
+      "caption": "pair visibility: a sample survives if both sites tie in additive distance and no third active site beats them"
+     },
+     {
+      "start": 482,
+      "end": 505,
+      "caption": "power cell: Sutherland-Hodgman clip against each power bisector, derived inline from |p-s|^2 - rs^2 <= |p-t|^2 - rt^2"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "solve_real_quadratic",
+      "line": 28
+     },
+     {
+      "name": "solve_apollonius_vertices",
+      "line": 56
+     },
+     {
+      "name": "apollonius_pair_visible",
+      "line": 149
+     },
+     {
+      "name": "build_apollonius_diagram",
+      "line": 206
+     },
+     {
+      "name": "build_power_diagram",
+      "line": 461
+     },
+     {
+      "name": "k_nearest_subset",
+      "line": 683
+     },
+     {
+      "name": "build_mw_voronoi",
+      "line": 718
+     },
+     {
+      "name": "apollonius_diagram_incremental_insert",
+      "line": 802
+     }
+    ]
+   },
+   {
+    "path": "automata/automata.cpp",
+    "title": "Divisibility DFA eliminated to a regex",
+    "language": "cpp",
+    "why": "The remainder automaton (state r, bit b -> (2r+b) mod n) turned into a regular expression by state elimination, with the empty language and epsilon kept distinct, a degree-based elimination order and expression-size budgets, checked against integer modulo.",
+    "highlights": [
+     {
+      "start": 30,
+      "end": 46,
+      "caption": "divisible_by: transitions (2r) mod n and (2r+1) mod n, plus a non-accepting entry state when the empty string is excluded"
+     },
+     {
+      "start": 50,
+      "end": 81,
+      "caption": "RegexAlgebra: nullopt is the empty language, \"\" is epsilon; either/sequence/repeat honour the absorbing and identity cases under a label budget"
+     },
+     {
+      "start": 116,
+      "end": 136,
+      "caption": "elimination order: remove the active state minimising incoming x outgoing edge count to keep intermediate labels small"
+     },
+     {
+      "start": 137,
+      "end": 158,
+      "caption": "elimination step R_ij <- R_ij | R_ik (R_kk)* R_kj, then the state's row and column cleared; the empty language renders as (?!)"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "BinaryDfa::validate",
+      "line": 9
+     },
+     {
+      "name": "BinaryDfa::accepts",
+      "line": 18
+     },
+     {
+      "name": "divisible_by",
+      "line": 30
+     },
+     {
+      "name": "RegexAlgebra",
+      "line": 52
+     },
+     {
+      "name": "to_regex",
+      "line": 84
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "section": "08-numerics-and-engineering",
+  "files": [
+   {
+    "path": "fft/fft.cpp",
+    "title": "Radix-2 FFT with compile-time backend policies and a measured planner",
+    "language": "cpp",
+    "why": "From my signal-processing library: a generated bit-reversal table, one butterfly shared by compile-time backend policies (serial, OpenMP, standard-C++ fork/join tasks), reusable plans with inverse transforms, and Plan::measured, which warms every compiled backend, checks agreement, and picks the lowest median of three timings.",
+    "highlights": [
+     {
+      "start": 15,
+      "end": 33,
+      "caption": "constexpr 256-entry byte-reversal table; a 32-bit index is reversed by assembling four reversed bytes and shifting right by 32-bits"
+     },
+     {
+      "start": 104,
+      "end": 135,
+      "caption": "one kernel template: if constexpr routes each loop to task_range or a plain for; the butterfly indexes roots_[offset * size/(2*half)] and conjugates the root for the inverse"
+     },
+     {
+      "start": 136,
+      "end": 171,
+      "caption": "OpenMP backend runs the permutation, every stage and the 1/N scale inside a single parallel region with implicit barriers; serial and task backends reuse the same lambdas through range()"
+     },
+     {
+      "start": 202,
+      "end": 241,
+      "caption": "measured(): reference transform from the first backend, every candidate checked at 1e-10 relative, median of three timed runs (copy outside the interval) selects the backend"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "reversal_table",
+      "line": 15
+     },
+     {
+      "name": "reverse",
+      "line": 28
+     },
+     {
+      "name": "task_range",
+      "line": 38
+     },
+     {
+      "name": "available_backends",
+      "line": 69
+     },
+     {
+      "name": "Plan::Plan",
+      "line": 84
+     },
+     {
+      "name": "Plan::kernel",
+      "line": 104
+     },
+     {
+      "name": "Plan::execute",
+      "line": 174
+     },
+     {
+      "name": "Plan::measured",
+      "line": 202
+     }
+    ]
+   },
+   {
+    "path": "ordered-set/ordered_set.hpp",
+    "title": "Left-leaning red-black set with cached sizes and executable invariants",
+    "language": "cpp",
+    "why": "An owning left-leaning red-black tree with insertion, deletion, cached subtree sizes and executable invariants (colour, order, black height, size), checked against std::set over 7,000 random operations; it succeeds the red-black tree from the author's first engine.",
+    "highlights": [
+     {
+      "start": 12,
+      "end": 27,
+      "caption": "static_asserts pin the exception model (nonthrowing comparator, nonthrowing key copy-assign) so rotations and erase never leave a half-updated tree; Node owns children via unique_ptr and caches its subtree count"
+     },
+     {
+      "start": 137,
+      "end": 164,
+      "caption": "LLRB balance: rotate left on a red right link, rotate right on two consecutive left reds, colour-flip a 4-node, refresh count; insert_at recurses then rebalances on unwind"
+     },
+     {
+      "start": 195,
+      "end": 224,
+      "caption": "erase_at: push a red link down the search path with move_red_left/move_red_right, replace the key with the in-order successor and erase_min the right subtree, balance on unwind"
+     },
+     {
+      "start": 225,
+      "end": 236,
+      "caption": "inspect: one recursion checks BST bounds, no red right link, no red-red, cached count, and returns black height or -1 on any violation"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "OrderedSet::insert",
+      "line": 54
+     },
+     {
+      "name": "OrderedSet::erase",
+      "line": 61
+     },
+     {
+      "name": "OrderedSet::valid",
+      "line": 87
+     },
+     {
+      "name": "rotate_left",
+      "line": 107
+     },
+     {
+      "name": "balance",
+      "line": 137
+     },
+     {
+      "name": "insert_at",
+      "line": 148
+     },
+     {
+      "name": "erase_at",
+      "line": 195
+     },
+     {
+      "name": "inspect",
+      "line": 225
+     }
+    ]
+   },
+   {
+    "path": "render-graph/render_graph.cpp",
+    "title": "Render graph: dependency order, cycle diagnosis, revision-cached plans",
+    "language": "cpp",
+    "why": "The headless core of ShaderWeave's scheduling: dependency ordering of selected outputs, current-frame cycle diagnosis with the offending path, explicit previous-frame reads kept out of the dependency edges, and revision-based plan caching with immutable old plans.",
+    "highlights": [
+     {
+      "start": 9,
+      "end": 40,
+      "caption": "every mutation bumps revision_ and drops the cached plan; set_inputs rejects unknown producers and erase refuses a node that another node still reads"
+     },
+     {
+      "start": 41,
+      "end": 56,
+      "caption": "plan(): outputs sorted and deduplicated so the cache key is canonical; a hit returns the same shared_ptr<const Plan>, otherwise a fresh plan stamped with the revision"
+     },
+     {
+      "start": 57,
+      "end": 88,
+      "caption": "DFS with unseen/active/complete marks: an active revisit throws the full stack as a current-frame cycle; previous_frame reads are recorded in history instead of recursing; post-order gives execution order"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "Graph::changed",
+      "line": 9
+     },
+     {
+      "name": "Graph::add",
+      "line": 14
+     },
+     {
+      "name": "Graph::set_inputs",
+      "line": 20
+     },
+     {
+      "name": "Graph::erase",
+      "line": 30
+     },
+     {
+      "name": "Graph::plan",
+      "line": 41
+     }
+    ]
+   },
+   {
+    "path": "bilateral-grid/bilateral_grid.cpp",
+    "title": "Bilateral grid: splat, separable blur, trilinear slice under a memory budget",
+    "language": "cpp",
+    "why": "Joint bilateral filtering by splat, separable 3D Gaussian blur and trilinear slice on a guide/signal grid, with a memory budget enforced before allocation, compared against a direct joint bilateral filter (RMSE 5.6e-4 on the test fixture).",
+    "highlights": [
+     {
+      "start": 33,
+      "end": 58,
+      "caption": "grid sizing: sigma converted to cell units, radius = ceil(cutoff·sigma), each axis padded by radius+1, product of dimensions checked against max_cells before the two cell buffers are allocated"
+     },
+     {
+      "start": 59,
+      "end": 94,
+      "caption": "visit_corners: position in cell units (x, y, guide), floor and fraction per axis, 8 corners weighted by the product of fraction or 1-fraction; splat accumulates weighted signal plus a homogeneous weight channel"
+     },
+     {
+      "start": 95,
+      "end": 124,
+      "caption": "separable 3D blur: per-axis normalised Gaussian kernel, axis coordinate recovered from the flat index via stride, out-of-range neighbours skipped, then grid and scratch swapped"
+     },
+     {
+      "start": 125,
+      "end": 140,
+      "caption": "slice: trilinear read at the same corners, divide by the accumulated weight channel, empty support is an error rather than a NaN"
+     }
+    ],
+    "key_functions": [
+     {
+      "name": "Image::validate",
+      "line": 9
+     },
+     {
+      "name": "bilateral_grid",
+      "line": 19
+     },
+     {
+      "name": "bounded_ceil (lambda)",
+      "line": 33
+     },
+     {
+      "name": "visit_corners (lambda)",
+      "line": 59
+     }
+    ]
+   }
+  ]
+ }
+]

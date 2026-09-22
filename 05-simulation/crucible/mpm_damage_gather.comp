@@ -1,0 +1,101 @@
+#version 450 core
+
+// Aniso Fracture v1 -- damage GATHER pass.
+// Reads the weight-normalized damage grid written by mpm_damage_scatter and
+// evaluates the non-local Laplacian Lap(d) at each particle, storing it in
+// frac_aux.y for mpm_p2g to consume THIS substep (zero latency: scatter ->
+// gather -> p2g, so p2g's Lap(d^n) matches the d^n it then integrates).
+//
+// Lap(d) is what turns a local threshold heuristic into an actual crack: it
+// couples neighbouring damage so a crack tip concentrates and PROPAGATES, and
+// it makes the crack width a physical length l0 rather than the particle
+// spacing (CD-MPM supplemental 6.1-6.2: without it, crack speed changes with
+// grid resolution).
+//
+// frac_aux is an imageBuffer, NOT an SSBO: image uniforms live in a separate
+// binding namespace, so this sidesteps the 16-SSBO cap that mpm_p2g/g2p sit at.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0)  readonly buffer PositionBuffer { vec2  positions[];    };
+layout(std430, binding = 7)  readonly buffer MatIDBuffer    { uint  material_ids[]; };
+layout(std430, binding = 47) readonly buffer JpBuffer       { float Jp_data[];      };
+layout(std430, binding = 49) readonly buffer DamageBuffer   { float damage[];       };
+layout(std430, binding = 33) readonly buffer GridDNum { int grid_dnum[]; };
+layout(std430, binding = 34) readonly buffer GridDDen { int grid_dden[]; };
+
+layout(binding = 7) uniform samplerBuffer u_fracture_profile_tex;
+layout(binding = 0, rgba32f) uniform coherent restrict imageBuffer u_frac_aux;
+
+uniform uint  u_offset, u_count;
+uniform float u_dx;
+uniform vec2  u_grid_origin;
+uniform ivec2 u_grid_res;
+
+const float INV_FIXED_SCALE = 1.0 / 1000000.0;
+
+vec3 bspline_weights(float fx) {
+    return vec3(0.5 * (1.5 - fx) * (1.5 - fx),
+                0.75 - (fx - 1.0) * (fx - 1.0),
+                0.5 * (fx - 0.5) * (fx - 0.5));
+}
+
+// Weight-normalized grid damage at a node; falls back to the particle's own d
+// where no material scattered (empty node), which makes Lap(d) -> 0 at a free
+// surface instead of pulling damage toward a phantom zero.
+float node_damage(ivec2 node, float d_self) {
+    if (node.x < 0 || node.y < 0 || node.x >= u_grid_res.x || node.y >= u_grid_res.y)
+        return d_self;
+    uint cell = uint(node.y * u_grid_res.x + node.x);
+    float den = float(grid_dden[cell]) * INV_FIXED_SCALE;
+    if (den < 1e-8) return d_self;
+    return clamp(float(grid_dnum[cell]) * INV_FIXED_SCALE / den, 0.0, 1.0);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= u_count) return;
+    uint p = u_offset + idx;
+
+    uint mat_type = material_ids[p] & 0x7Fu;
+    vec4 fpB = texelFetch(u_fracture_profile_tex, int(mat_type) * 2 + 1);
+    uint flags = uint(fpB.w + 0.5);
+    if ((flags & 1u) == 0u) return; // not enrolled: leave frac_aux untouched
+
+    // MPM-local lane -> idx: same index space as the scatter pass.
+    float d_self = ((flags & 2u) != 0u) ? Jp_data[idx] : damage[idx];
+
+    vec2 pos = positions[p];
+    float inv_dx = 1.0 / u_dx;
+    vec2 cell_pos = (pos - u_grid_origin) * inv_dx;
+
+    // Lap(d) over the SAME 3x3 quadratic-B-spline support the scatter deposited into,
+    // using the kernel's own second derivative (spec 4.2):
+    //     LapN_i = N''(x)N(y) + N(x)N''(y)
+    // For the quadratic B-spline the three weights are 0.5(1.5-f)^2, 0.75-(f-1)^2 and
+    // 0.5(f-0.5)^2, whose second derivatives w.r.t. f are exactly (1, -2, 1) -- constant,
+    // so this costs nothing over a hand-rolled stencil and is consistent by construction.
+    // The stencil must be centred where the scatter centred it, at
+    // floor(cell_pos - 0.5) + 1 == round(cell_pos). A stencil centred on floor(cell_pos)
+    // would agree only when fract(cell_pos) < 0.5: for about half of all particles the
+    // Laplacian would be sampled a full node down and to the left of the particle, with
+    // the offset flipping discontinuously as a particle drifts across each half-cell line.
+    ivec2 base = ivec2(floor(cell_pos - 0.5));
+    vec2 fx = cell_pos - vec2(base);
+    vec3 wx = bspline_weights(fx.x);
+    vec3 wy = bspline_weights(fx.y);
+    const vec3 c2 = vec3(1.0, -2.0, 1.0); // d^2/df^2 of the quadratic B-spline weights
+
+    float lap = 0.0;
+    for (int gy = 0; gy < 3; ++gy) {
+        for (int gx = 0; gx < 3; ++gx) {
+            float dn = node_damage(base + ivec2(gx, gy), d_self);
+            lap += dn * (c2[gx] * wy[gy] + wx[gx] * c2[gy]);
+        }
+    }
+    lap *= inv_dx * inv_dx;
+
+    vec4 aux = imageLoad(u_frac_aux, int(idx));
+    aux.y = lap;
+    imageStore(u_frac_aux, int(idx), aux);
+}

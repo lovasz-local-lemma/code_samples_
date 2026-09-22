@@ -1,0 +1,71 @@
+--- upstream/path_tracer/PathTracerSettings.hpp
++++ this-branch/experimental-path-tracer/PathTracerSettings.hpp
+@@ -1,2 +1,5 @@
++// Review copy of an altered Tungsten research branch. See README.md and LICENSE.txt.
++// Formatting/comment cleanup only; host-renderer dependencies are not bundled.
++
+ #ifndef PATHTRACERSETTINGS_HPP_
+ #define PATHTRACERSETTINGS_HPP_
+@@ -6,6 +9,29 @@
+ #include "io/JsonObject.hpp"
+ 
++#include <iostream>
++#include <vector>
++
++#include "StringableEnum.hpp"
++
+ namespace Tungsten
+ {
++
++#define br "\n"
++#define varName(Vname) (str(#Vname))
++#define varNameC(Vname) (#Vname)
++#define fetch(XX) value.getField(varNameC(XX), XX)
++#define def_if_no(XX, val)  if(!fetch(XX)) XX=val
++
++#ifndef puts
++#define puts std::cout<<
++#endif
++
++#ifndef iss
++    using str = std::string;
++    using ost = std::ostream;
++
++    template <class T> using arr = std::vector<T>;
++    using iss = std::istringstream;
++#endif
+ 
+     struct PathTracerSettings : public TraceSettings
+@@ -48,4 +74,32 @@
+     };
+ 
++    enum A_ter
++    {
++        A_dist,
++        A_theta,
++        A_phi
++    };
++
++    //surf type
++    enum S_typ
++    {
++        S_plane = 0,
++        S_cone = 1,
++        S_cylinder = 2,
++        S_sphere = 3,
++        S_disk,
++        S_torus,
++        S_hyperb,
++        S_Q,
++        S_unknown
++    };
++
++    enum C_typ
++    {
++        C_point = 0,
++        C_beam = 1,
++        C_unknown = 65535
++    };
++
+ }
+ 

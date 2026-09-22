@@ -1,0 +1,18 @@
+# RadianceLab — research renderer
+
+RadianceLab is my interactive research renderer: ten rendering modes in one studio, photon primitives as
+the centrepiece, everything shown live. These excerpts are the parts a rendering lead should read; the
+full system is on the portfolio (recordings, live views): https://lovasz-local-lemma.github.io/projects/radiance-lab/index.html
+
+| Read | What it shows |
+| --- | --- |
+| [`pp_hourglass_sheet_solver.cpp`](pp_hourglass_sheet_solver.cpp) (excerpt of `PPIntegrator.cpp`) | The photon hourglass. A light ray refracted through a chain of collinear glass balls is revolved about the light-to-centre axis, giving a degree-2 sheet; the camera ray meets it in a ray-centred, double-precision quadratic whose discriminant *is* the co-area Jacobian the estimator divides by (`J² = |N|² − W τ²`), with citardauq root pairing and a branch-recovery test that rejects the mirror-image sheet. `PPHgChain` / `ppHgBuildChainGeom` (Snell in, chord, Snell out, Fresnel products, per-segment prefixes) → `ppHgSolveSheet` → `ppHgRecoverBranch` → `ppHgVertexPdf`. |
+| [`pp_rasterized_gather.cpp`](pp_rasterized_gather.cpp) (excerpt of `PPIntegrator.cpp`) | The rasterized correlated gather: each frozen photon primitive is bounded in screen space by the convex hull of its projected points (Andrew's monotone chain) plus supporting planes through the camera found in double precision; records are counting-sorted into per-scanline lists and gathered by a `parallelFor` over rows with thread-local scratch — no atomics, film byte-identical to the tracing gather. `ppHull2D`, `ppRastAddHull`, `ppRastAddCone`, `ppRastRow`, `ppRasterGather`. |
+| [`pt_bdpt_mis_excerpt.glsl`](pt_bdpt_mis_excerpt.glsl) + [`pt_bdpt_weights.glsl`](pt_bdpt_weights.glsl) | Bidirectional MIS in a compute shader: forward and reverse area-measure pdfs per vertex of an assembled path (full-film camera density, GGX half-vector pdf with the folded preimage, HG phase, medium transmittance), then prefix/suffix products in log space for balance or power weights. Veach's s/t enumeration, NEE-vs-emission density distinctions, delta vertices. |
+| [`PhaseUnwrap.cpp`](PhaseUnwrap.cpp) | A GPU-resident weighted-least-squares phase unwrapper: wrapped-gradient divergence as RHS, masked 5-point weighted Laplacian as operator, preconditioned conjugate gradient with an FFT Poisson preconditioner (shared-memory radix-2 rows/columns, spectral divide, inverse), dot products reduced on the GPU. `applyPoissonPrecond`, `runWLS_PCG`. |
+| [`PPShapeClassify.h`](PPShapeClassify.h) | Header-only classifier from "which (θ, φ, dist) dimensions are swept at which path vertices" to the analytic manifold the endpoint family traces (point, arc, circle, sphere cap, cone, disk, planar sector, ball sector, parallelogram / parallelepiped / parallelotope, compound), with the translation-commutation argument written out and degeneracy thresholds exposed. Unit-tested. |
+| [`BoundaryDerivativeMath.h`](BoundaryDerivativeMath.h) | A self-contained differentiable-rendering study: the derivative of pixel radiance with respect to translating a sharp-edged emitter as a boundary integral with the co-area factor `1/|∇u|`, Sutherland–Hodgman clipping of the unit pixel against the source half-planes, compared against central finite differences at two step sizes. Why naive finite differences of visibility are wrong, and the edge term done right. |
+
+The two `PPIntegrator.cpp` excerpts are not standalone translation units; the surrounding file supplies
+`Scene`, `Camera`, `RNG`, `ThreadPool` and the `PPPrim` record. The GLSL excerpt relies on uniforms and
+SSBOs from the tracer's shared modules. Both keep their exact source line ranges in the header line.

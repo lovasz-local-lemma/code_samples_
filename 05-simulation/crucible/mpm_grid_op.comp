@@ -1,0 +1,215 @@
+#version 450 core
+
+// MPM grid: decode fixed-point → velocity, apply gravity + SDF BCs
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 40) readonly buffer GridMass  { int   grid_mass[];  };
+layout(std430, binding = 41) readonly buffer GridMomX  { int   grid_mom_x[]; };
+layout(std430, binding = 42) readonly buffer GridMomY  { int   grid_mom_y[]; };
+layout(std430, binding = 43) writeonly buffer GridVelX { float grid_vel_x[]; };
+layout(std430, binding = 44) writeonly buffer GridVelY { float grid_vel_y[]; };
+layout(std430, binding = 45) writeonly buffer GridTemp  { float grid_temp[];  };
+layout(std430, binding = 55) readonly buffer GridTempA  { int   grid_temp_ato[]; };
+// Coupling v2: the SPH->MPM reaction impulse scattered by sph_mpm_reaction during
+// the PREVIOUS SPH step (SPH runs after the MPM step, hence one-frame latency).
+// Consumed and zeroed here so it is applied exactly once.
+layout(std430, binding = 35) buffer GridReactX { int grid_react_x[]; };
+layout(std430, binding = 36) buffer GridReactY { int grid_react_y[]; };
+
+layout(binding = 0) uniform sampler2D u_sdf_tex;
+
+uniform uint  u_grid_cells;
+uniform ivec2 u_grid_res;
+uniform float u_dx;
+uniform float u_dt;
+uniform vec2  u_grid_origin;
+uniform vec2  u_gravity;
+uniform vec2  u_sdf_world_min;
+uniform vec2  u_sdf_world_max;
+uniform int   u_use_sdf;
+// Mouse force for MPM
+uniform vec2  u_mouse_world;
+uniform float u_mouse_radius;
+uniform float u_mouse_inner_radius;
+uniform float u_mouse_force;
+uniform vec2  u_mouse_dir;
+uniform int   u_mouse_mode;
+// Real 2.5D grid-bridged out-of-plane support. 0 = off/identical.
+uniform int   u_coupling_v2; // Coupling v2: apply the SPH->MPM reaction impulse
+uniform int   u_real_25d;
+uniform float u_real_25d_support;   // gravity-reduction gain for overhang-bridged nodes [0..1]
+uniform float u_real_25d_bridge;    // lateral cohesion gain
+uniform float u_real_25d_full_mass; // decoded grid-mass that reads as full coverage
+uniform float u_real_25d_lo;        // coverage below this = void
+uniform float u_real_25d_hi;        // coverage above this = solid
+
+const float INV_FIXED_SCALE = 1.0 / 1000000.0;
+const float FIXED_SCALE = 1000000.0;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= u_grid_cells) return;
+
+    float m = float(grid_mass[idx]) * INV_FIXED_SCALE;
+
+    // Coupling v2: read AND clear the SPH->MPM reaction impulse for EVERY cell, before
+    // the empty-cell early-out. SPH deposits with B-spline weights, so it reaches nodes
+    // that carry no MPM mass this frame; if those were only cleared on the mass path the
+    // fixed-point accumulator would grow without bound (int32 wrap) and later slam any
+    // material that drifted in with minutes of stale impulse.
+    vec2 react_impulse = vec2(0.0);
+    if (u_coupling_v2 == 1) {
+        react_impulse = vec2(float(grid_react_x[idx]), float(grid_react_y[idx])) * INV_FIXED_SCALE;
+        grid_react_x[idx] = 0;
+        grid_react_y[idx] = 0;
+    }
+
+    if (m < 1e-10) {
+        grid_vel_x[idx] = 0.0;
+        grid_vel_y[idx] = 0.0;
+        return;
+    }
+
+    // Decode momentum → velocity
+    vec2 vel = vec2(
+        float(grid_mom_x[idx]) * INV_FIXED_SCALE / m,
+        float(grid_mom_y[idx]) * INV_FIXED_SCALE / m
+    );
+
+    // Coupling v2: apply the SPH->MPM reaction impulse (Newton's 3rd law). Impulse is
+    // a momentum, so dividing by the node mass gives the velocity change directly --
+    // no dt factor, it was already integrated when SPH recorded it. Already consumed
+    // (zeroed) above so it is applied exactly once. Clamped so a degenerate near-empty
+    // node cannot produce an unbounded kick.
+    if (u_coupling_v2 == 1 && dot(react_impulse, react_impulse) > 1e-18) {
+        vec2 dv = react_impulse / max(m, 1e-6);
+        float max_dv = u_dx / max(u_dt, 1e-6); // <= one cell per step
+        float dv_len = length(dv);
+        if (dv_len > max_dv) dv *= max_dv / dv_len;
+        vel += dv;
+    }
+
+    // Grid node world position
+    ivec2 node = ivec2(idx % uint(u_grid_res.x), idx / uint(u_grid_res.x));
+    vec2 world_pos = u_grid_origin + vec2(node) * u_dx;
+
+    // Real 2.5D out-of-plane support: z-material (grid mass) that OVERHANGS a void
+    // directly below is held up by the load path the flat 2D slice cannot see, and
+    // is nudged toward denser side-neighbours so thin spans stay attached. This is
+    // the mechanism the pseudo_25d stiffness gates lack -- it bridges a topological
+    // gap instead of merely postponing the tear. Bounded (support in [0,1], gravity
+    // only scaled DOWN, never inverted -> worst case neutral buoyancy) and inserted
+    // BEFORE the SDF/boundary BC + velocity clamp below so it cannot punch walls.
+    // When off, this reduces to exactly `vel += u_dt * u_gravity`.
+    float support_factor = 1.0;
+    if (u_real_25d == 1) {
+        float invfull = 1.0 / max(u_real_25d_full_mass, 1e-6);
+        float cov_self = clamp(m * invfull, 0.0, 1.0);
+        int rx = u_grid_res.x;
+        // Coverage of the row directly BELOW (avg of up-to-3 cells).
+        float cov_below = 0.0; int nb = 0;
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = node.x + dx, ny = node.y - 1;
+            if (nx >= 0 && nx < rx && ny >= 0) {
+                cov_below += clamp(float(grid_mass[ny * rx + nx]) * INV_FIXED_SCALE * invfull, 0.0, 1.0);
+                ++nb;
+            }
+        }
+        cov_below = (nb > 0) ? cov_below / float(nb) : 0.0;
+        // Side coverages (attachment + lateral cohesion gradient).
+        int lxi = max(node.x - 1, 0), rxi = min(node.x + 1, rx - 1);
+        float cov_l = clamp(float(grid_mass[node.y * rx + lxi]) * INV_FIXED_SCALE * invfull, 0.0, 1.0);
+        float cov_r = clamp(float(grid_mass[node.y * rx + rxi]) * INV_FIXED_SCALE * invfull, 0.0, 1.0);
+        float cov_side = max(cov_l, cov_r);
+
+        float overhang    = clamp(cov_self - cov_below, 0.0, 1.0); // more material here than beneath
+        float solid_gate  = smoothstep(u_real_25d_lo, u_real_25d_hi, cov_self);
+        // Attachment requires a side-neighbour that is a real ANCHOR -- denser than this
+        // node -- not merely present. A rigid body in free fall has laterally-uniform
+        // coverage (cov_side ~= cov_self) so this collapses to 0 and it falls at full g;
+        // a thin span bridged by denser z-anchored walls (cov_side > cov_self) still holds.
+        float attach      = smoothstep(u_real_25d_lo, u_real_25d_hi, cov_side)
+                          * smoothstep(0.0, max(u_real_25d_hi - u_real_25d_lo, 1e-4), cov_side - cov_self);
+        float s           = solid_gate * overhang * attach;
+        support_factor    = 1.0 - clamp(u_real_25d_support, 0.0, 1.0) * s;
+
+        // Lateral cohesion: gentle pull toward the denser side so a thin span stays
+        // attached to its z-anchored ends (bounded; the velocity clamp below caps it).
+        vel.x += u_real_25d_bridge * (cov_r - cov_l) * u_dx * u_dt * solid_gate;
+    }
+
+    // Gravity (scaled by out-of-plane support when Real 2.5D is on).
+    vel += u_dt * u_gravity * support_factor;
+
+    // Mouse force on grid (applies to MPM)
+    if (u_mouse_force != 0.0) {
+        vec2 to_mouse = u_mouse_world - world_pos;
+        float dist = length(to_mouse);
+        if (u_mouse_mode == 3 || u_mouse_mode == 1) {
+            // Telekinesis and Real Drag are applied per-particle in G2P.
+            // No grid-level force here — would cause contraction.
+        } else if (dist < u_mouse_radius && dist > 1e-4) {
+            float hard_r = clamp(u_mouse_inner_radius, 0.0, u_mouse_radius);
+            float shell = max(u_mouse_radius - hard_r, 1e-4);
+            float falloff = 1.0;
+            if (dist > hard_r && u_mouse_radius > hard_r + 1e-4) {
+                float t = clamp((dist - hard_r) / shell, 0.0, 1.0);
+                falloff = 1.0 - t * t * (3.0 - 2.0 * t);
+            }
+            if (u_mouse_mode == 2 && length(u_mouse_dir) > 1e-5) {
+                float sweep = (dist <= hard_r) ? 1.0 : clamp(1.0 - (dist - hard_r) / shell, 0.0, 1.0);
+                vel += normalize(u_mouse_dir) * u_mouse_force * sweep * sweep * u_dt;
+            } else if (u_mouse_mode == 1 && length(u_mouse_dir) > 1e-5) {
+                vel += normalize(u_mouse_dir) * u_mouse_force * falloff * falloff * u_dt;
+            } else {
+                vec2 dir = to_mouse / dist;
+                float strength = u_mouse_force * falloff;
+                vel += dir * strength * u_dt;
+            }
+        }
+    }
+
+    // SDF boundary conditions
+    if (u_use_sdf == 1) {
+        vec2 uv = (world_pos - u_sdf_world_min) / (u_sdf_world_max - u_sdf_world_min);
+        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+            float d = texture(u_sdf_tex, uv).r;
+            float margin = u_dx * 1.5;
+            if (d < margin) {
+                vec2 eps = (u_sdf_world_max - u_sdf_world_min) / vec2(textureSize(u_sdf_tex, 0));
+                float dx_sdf = texture(u_sdf_tex, uv + vec2(eps.x, 0)).r
+                             - texture(u_sdf_tex, uv - vec2(eps.x, 0)).r;
+                float dy_sdf = texture(u_sdf_tex, uv + vec2(0, eps.y)).r
+                             - texture(u_sdf_tex, uv - vec2(0, eps.y)).r;
+                vec2 n = normalize(vec2(dx_sdf, dy_sdf) + 1e-8);
+                float vn = dot(vel, n);
+                if (vn < 0.0) {
+                    vel -= vn * n;
+                    vel *= 0.9; // Friction
+                }
+            }
+        } else {
+            // Outside SDF domain → hard stop
+            vel = vec2(0.0);
+        }
+    }
+
+    // Grid boundary
+    int bnd = 3;
+    if (node.x < bnd || node.x >= u_grid_res.x - bnd) vel.x = 0.0;
+    if (node.y < bnd) vel.y = max(vel.y, 0.0);
+    if (node.y >= u_grid_res.y - bnd) vel.y = min(vel.y, 0.0);
+
+    // Very tight velocity clamping: max 3 cells per timestep
+    float max_vel = u_dx * 3.0 / u_dt;
+    float spd = length(vel);
+    if (spd > max_vel) vel *= max_vel / spd;
+
+    grid_vel_x[idx] = vel.x;
+    grid_vel_y[idx] = vel.y;
+
+    // Decode mass-weighted temperature: T_grid = (sum m*T) / (sum m)
+    float temp_weighted = float(grid_temp_ato[idx]) * (1.0 / (FIXED_SCALE * 0.001));
+    grid_temp[idx] = temp_weighted / m; // Mass-averaged temperature
+}

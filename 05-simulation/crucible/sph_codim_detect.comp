@@ -1,0 +1,105 @@
+#version 450 core
+
+// Codimensional SPH: detect local dimensionality per particle.
+// Computes covariance matrix of neighbor positions → eigenvalue ratio.
+// If ratio < threshold: particle is on a thin feature (thread/film), use 1D kernel.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionBuffer { vec2 positions[]; };
+layout(std430, binding = 12) readonly buffer SortedIndexBuf { uint sorted_indices[]; };
+layout(std430, binding = 13) readonly buffer CellStartBuf { uint cell_start[]; };
+layout(std430, binding = 14) readonly buffer CellEndBuf { uint cell_end[]; };
+
+// Output: per-particle codim data
+// .xy = principal direction (tangent of thin feature)
+// .z  = dimensionality ratio (0=1D thread, 1=2D bulk)
+// .w  = effective kernel scale factor
+layout(std430, binding = 16) writeonly buffer CodimBuffer { vec4 codim_data[]; };
+
+uniform uint u_offset;
+uniform uint u_count;
+uniform float u_h;
+uniform uint u_table_size;
+uniform float u_cell_size;
+uniform vec2 u_world_min;
+uniform float u_codim_threshold; // Below this ratio → 1D (default 0.25)
+
+#include "common/sph_kernels.glsl"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= u_count) return;
+
+    uint i = u_offset + idx;
+    vec2 pos_i = positions[i];
+
+    // Compute weighted covariance matrix of neighbor positions
+    // C = Σ w_j * (x_j - x_i) ⊗ (x_j - x_i)
+    float cxx = 0.0, cxy = 0.0, cyy = 0.0;
+    float w_sum = 0.0;
+    int n_neighbors = 0;
+
+    ivec2 cell_i = pos_to_cell_2d(pos_i, u_cell_size, u_world_min);
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            uint hash = hash_cell_2d(cell_i + ivec2(dx, dy), u_table_size);
+            uint start = cell_start[hash];
+            uint end_idx = cell_end[hash];
+
+            for (uint s = start; s < end_idx; s++) {
+                uint j = sorted_indices[s];
+                if (j == i) continue;
+
+                vec2 d = positions[j] - pos_i;
+                float r = length(d);
+
+                if (r < 2.0 * u_h && r > 1e-6) {
+                    float w = W_cubic(r, u_h);
+                    cxx += w * d.x * d.x;
+                    cxy += w * d.x * d.y;
+                    cyy += w * d.y * d.y;
+                    w_sum += w;
+                    n_neighbors++;
+                }
+            }
+        }
+    }
+
+    // Default: 2D bulk
+    vec4 result = vec4(1.0, 0.0, 1.0, 1.0); // dir=(1,0), ratio=1, scale=1
+
+    if (n_neighbors >= 3 && w_sum > 1e-8) {
+        // Normalize covariance
+        cxx /= w_sum;
+        cxy /= w_sum;
+        cyy /= w_sum;
+
+        // 2x2 eigenvalue decomposition
+        float T = cxx + cyy;          // Trace
+        float D = cxx * cyy - cxy * cxy; // Determinant
+        float disc = sqrt(max(T * T * 0.25 - D, 0.0));
+        float lambda1 = T * 0.5 + disc; // Larger eigenvalue
+        float lambda2 = T * 0.5 - disc; // Smaller eigenvalue
+
+        float ratio = (lambda1 > 1e-10) ? lambda2 / lambda1 : 1.0;
+
+        // Principal direction (eigenvector of lambda1)
+        vec2 principal;
+        if (abs(cxy) > 1e-10) {
+            principal = normalize(vec2(lambda1 - cyy, cxy));
+        } else {
+            principal = (cxx >= cyy) ? vec2(1, 0) : vec2(0, 1);
+        }
+
+        // Kernel scale: for 1D features, effective kernel needs adjustment
+        // In 1D: density = Σ m * W_1D(r_perp, h) where r_perp is distance
+        // perpendicular to the tangent direction
+        float scale = mix(1.0, 2.0, clamp(1.0 - ratio / u_codim_threshold, 0.0, 1.0));
+
+        result = vec4(principal, ratio, scale);
+    }
+
+    codim_data[idx] = result;
+}

@@ -1,0 +1,3221 @@
+// My research branch of Tungsten (Benedikt Bitterli). See CONTRIBUTION.md and LICENSE.txt.
+// Formatting/comment cleanup only; host-renderer dependencies are not bundled.
+
+#ifndef PHOTON_HPP_
+#define PHOTON_HPP_
+
+#include "math/Vec.hpp"
+#include "core/media/Medium.hpp"
+#include "core/samplerecords/SurfaceScatterEvent.hpp"
+#include "core/integrators/photon_map/PhotonMapSettings.hpp"
+#include "core/integrators/photon_map/PhotonPrimitiveSettings.hpp"
+
+#include "core/math/Box.hpp"
+
+#include "core/primitives/Primitive.hpp"
+#include "core/primitives/IntersectionInfo.hpp"
+#include "core/media/Medium.hpp"
+
+#include "core/sampling/SampleWarp.hpp"
+#include "core/phasefunctions/PhaseFunction.hpp"
+
+#include <set>
+
+namespace Tungsten
+{
+
+    const Vec3f one_sq3 = Vec3f(1.0f) / sqrtf(3.0f);
+    const Vec3f one_sq2 = Vec3f(1.0f) / sqrtf(2.0f);
+
+#ifndef M_or_not
+    enum SS_or_not
+    {
+        X = 0,
+        O = 1
+    };
+#endif // !M_or_not
+
+    struct Photon
+    {
+        uint32 splitData;
+        uint32 bounce;
+        Vec3f pos;
+        Vec3f dir;
+        Vec3f power;
+
+        void setSplitInfo(uint32 childIdx, uint32 splitDim, uint32 childCount)
+        {
+            uint32 childMask = childCount == 0 ? 0 : (childCount == 1 ? 1 : 3);
+            splitData = (splitDim << 30u) | (childMask << 28u) | childIdx;
+        }
+
+        bool hasLeftChild() const
+        {
+            return (splitData & (1u << 28u)) != 0;
+        }
+
+        bool hasRightChild() const
+        {
+            return (splitData & (1u << 29u)) != 0;
+        }
+
+        uint32 splitDim() const
+        {
+            return splitData >> 30u;
+        }
+
+        uint32 childIdx() const
+        {
+            return splitData & 0x0FFFFFFFu;
+        }
+    };
+
+    struct VolumePhoton : public Photon
+    {
+        Vec3f minBounds;
+        Vec3f maxBounds;
+        float radiusSq;
+    };
+
+    class feature_blob
+    {
+      public:
+        switch_field profile;
+
+        class surface_kit
+        {
+          public:
+            /*SURFACE*/
+            const Bsdf *BS = nullptr;
+            SurfaceScatterEvent event;
+            Vec3f norm;
+
+            void operator=(const surface_kit SK2)
+            {
+                BS = SK2.BS;
+                event = SK2.event;
+                norm = SK2.norm;
+            }
+
+            surface_kit(const surface_kit &SK2)
+            {
+                *this = SK2;
+            }
+
+            surface_kit() {}
+        };
+
+        class marg_kit
+        {
+          public:
+            /*dangling dir and dist*/
+            float marg_len;
+            Vec3f marg_dir;
+
+            marg_kit() {}
+
+            void operator=(const marg_kit &MK2)
+            {
+                marg_len = MK2.marg_len;
+                marg_dir = MK2.marg_dir;
+            }
+
+            marg_kit(const marg_kit &MK2)
+            {
+                *this = MK2;
+            }
+        };
+
+        class edge_kit
+        {
+          public:
+            Edge E;
+            bool sampled_dist = false;
+
+            void operator=(const edge_kit &ek2)
+            {
+                E = ek2.E;
+                sampled_dist = ek2.sampled_dist;
+            }
+
+            edge_kit(const edge_kit &ek2)
+            {
+                *this = ek2;
+            }
+
+            edge_kit() {}
+        };
+        edge_kit feature_edge;
+
+        // when dirJAC is const, so is Normal
+        class const_FACING_kit
+        {
+          public:
+            Vec3f constNormal;
+            float constJAC;
+
+            void operator=(const const_FACING_kit &FK2)
+            {
+                constNormal = FK2.constNormal;
+                constJAC = FK2.constJAC;
+            }
+
+            const_FACING_kit(const const_FACING_kit &FK2)
+            {
+                *this = FK2;
+            }
+
+            const_FACING_kit() {}
+        };
+        const_FACING_kit feature_JAC;
+
+        class Matrix_kit
+        {
+          public:
+            Mat4f W2L;
+            Mat4f L2W;
+
+            void operator=(const Matrix_kit &mk2)
+            {
+                W2L = mk2.W2L;
+                L2W = mk2.L2W;
+            }
+
+            Matrix_kit(const Matrix_kit &mk2)
+            {
+                *this = mk2;
+            }
+
+            Matrix_kit() {}
+        };
+        Matrix_kit feature_matrix;
+
+        marg_kit feature_marg;
+        Primitive::LS_info feature_LS;
+        surface_kit feature_SF;
+        arr<Medium::NullVertex> feature_nvs;
+
+        void operator=(const feature_blob &FB2)
+        {
+            // copies every kit regardless of profile; could be narrowed to the enabled features
+            profile = FB2.profile;
+            feature_marg = FB2.feature_marg;
+            feature_LS = FB2.feature_LS;
+            feature_SF = FB2.feature_SF;
+            feature_matrix = FB2.feature_matrix;
+            feature_nvs = FB2.feature_nvs;
+            feature_edge = FB2.feature_edge;
+            feature_JAC = FB2.feature_JAC;
+        }
+
+        void add_LS(Primitive::LS_info &LS)
+        {
+            profile.turn_on(EF_LT);
+            feature_LS = LS;
+        }
+
+        void add_EDGE(const Edge &ed)
+        {
+            profile.turn_on(EF_edge);
+            feature_edge.E = ed;
+        }
+
+        void add_MAT(const Vec3f &dx, const Vec3f &dy, const Vec3f &dz, const Vec3f &orig)
+        {
+            profile.turn_on(EF_matrix);
+
+            feature_matrix.L2W = Mat4f(dx.x(), dy.x(), dz.x(), orig.x(), dx.y(), dy.y(), dz.y(), orig.y(),
+                                       dx.z(), dy.z(), dz.z(), orig.z(), 0.f, 0.f, 0.f, 1.f);
+            feature_matrix.W2L = feature_matrix.L2W.invert();
+        }
+
+        feature_blob(const feature_blob &FB2)
+        {
+            *this = FB2;
+        }
+
+        feature_blob()
+        {
+            profile.clear();
+        }
+
+        // feature: only orig data
+        // computed subpath: extra data
+        enum extra_feature
+        {
+            // filled when needed
+            EF_marg_dist = 1 << 0, /*has dangling dist*/
+            EF_marg_dir = 1 << 1,  /*has dangling dir*/
+
+            EF_matrix = 1 << 2,
+
+            EF_LT = 1 << 3, /*on light source*/
+            EF_SF = 1 << 4, /*on surface*/
+
+            EF_null = 1 << 5, /*null vertices*/
+            EF_edge = 1 << 6  /*edges (differential)*/
+        };
+
+        void clear_features()
+        {
+            profile.clear();
+        }
+
+        void enable_feature(extra_feature ef)
+        {
+            profile.turn_on(ef);
+        }
+
+        void disable_feature(extra_feature ef)
+        {
+            profile.turn_off(ef);
+        }
+
+        bool has_feature(extra_feature ef)
+        {
+            return profile.is_on(ef);
+        }
+    };
+
+    class PP
+    {
+      public:
+        void clear()
+        {
+            features.clear_features();
+            handler = -1;
+            handler_prim = -1;
+
+            dim_within_LS = -1;
+            index_pathL = -1;
+            index_pathR = -1;
+        }
+
+        PP() {}
+
+        int LS_dim_index()
+        {
+            return dim_within_LS;
+        }
+
+        PP(const PP &pp)
+        {
+            (*this) = pp;
+        }
+
+        int32 b() const
+        {
+            return BC;
+        }
+
+        int32 bm() const
+        {
+            return BM;
+        }
+
+        int index;
+        int dim_within_LS = -1;
+        int index_pathL = -1;
+        int index_pathR = -1;
+
+        Vec3f pos;
+        Vec3f power;
+
+        Vec3f dir;
+        Vec3f vct;
+
+        Edge E;
+
+        Vec3f LT_seg;
+
+        // already marginalizable
+        bool this2next_Marginalizable = false;
+        bool this2next_dist_Marginalizable = false;
+        bool this2next_dir_Marginalizable = false;
+
+        // blocked len, noclip len, marginalizable len
+        float length = -1;
+        // sampled length
+        float length_noclip = -1;
+        Vec3f pos_noclip;
+
+        // not needed for homo trans
+        Vec3f dir_marg;
+        float length_marg = -1; // could also need this when not homo_transmittance
+        // for homo, just pos_noclip
+        Vec3f pos_marg;
+
+        int32 BC = -1;
+        int32 BM = -1;
+
+        feature_blob features;
+
+        void operator=(const PP &pt2)
+        {
+            index = pt2.index;
+            dim_within_LS = pt2.dim_within_LS;
+
+            pos = pt2.pos;
+            power = pt2.power;
+
+            dir = pt2.dir;
+            vct = pt2.vct;
+
+            length = pt2.length;
+            length_noclip = pt2.length_noclip;
+
+            pos_noclip = pt2.pos_noclip;
+
+            dir_marg = pt2.dir_marg;
+            length_marg = pt2.length_marg;
+
+            BC = pt2.BC;
+            BM = pt2.BM;
+
+            features = pt2.features;
+        }
+
+        // -1: no handler
+        int handler = -1;
+        int handler_prim = -1;
+
+        bool will_render()
+        {
+            return handler >= 0;
+        }
+
+        void setPathInfo(int32 b, int32 bm)
+        {
+            BC = b;
+            BM = bm;
+        }
+
+        void setIndex(uint32 ind)
+        {
+            index = ind;
+        }
+
+        // assuming homo, onSurf <> BM==0
+        // if LT2dims
+        // LS bounce not count as surf INTERACTION
+        bool homo_onSurface() const
+        {
+            // no BM and not extended
+            return (BM == 0 && BC >= 0);
+        }
+
+        bool LT_related()
+        {
+            return BC <= 0;
+        }
+
+        // on LT
+        bool initial() const
+        {
+            return BM == 0 && BC == 0;
+        }
+
+        friend ost &operator<<(ost &o1, const PP &pp)
+        {
+            o1 << pp.index << "[" << pp.index_pathL << ", " << pp.index_pathR << "]"
+               << "= { " << pp.BC << "::" << pp.BM << " } M:" << pp.this2next_Marginalizable;
+            return o1;
+        }
+    };
+
+    struct PathPhoton
+    {
+      public:
+        PathPhoton() {}
+
+        void operator=(const PathPhoton &pt2)
+        {
+            index_comb_start = pt2.index_comb_start;
+            index_prim_start = pt2.index_prim_start;
+
+            index_LT = pt2.index_LT;
+
+            pos = pt2.pos;
+            power = pt2.power;
+
+            dir = pt2.dir;
+            dir_marg = pt2.dir_marg;
+
+            length = pt2.length;
+            sampledLength = pt2.sampledLength;
+            length_marg = pt2.length_marg;
+
+            power_noclip = pt2.power_noclip;
+            pos_noclip = pt2.pos_noclip;
+
+            power_marg = pt2.power_marg;
+            pos_marg = pt2.pos_marg;
+
+            BC = pt2.BC;
+            BCSS = pt2.BCSS;
+            BCSS_noclip = pt2.BCSS_noclip;
+            BC_M = pt2.BC_M;
+            BC_M_NL = pt2.BC_M_NL;
+
+            extra = pt2.extra;
+
+            handler = pt2.handler;
+
+            index = pt2.index;
+        }
+
+        PathPhoton(const PathPhoton &PP)
+        {
+            (*this) = PP;
+        }
+
+        uint32 index;
+
+        uint32 index_LT = -1;
+
+        uint32 index_comb_start = -1;
+        uint32 index_prim_start = -1;
+
+        Vec3f pos;
+        Vec3f power;
+
+        Vec3f dir;
+        Vec3f dir_marg;
+
+        // blocked len, noclip len, marginalizable len
+        float length = -1;
+        float sampledLength = -1;
+        float length_marg = -1; // could also need this when not homo_transmittance
+
+        //each one can store an extra dir and dist
+
+        // use sampledLength to get the noclip position
+
+        Vec3f power_noclip;
+        Vec3f pos_noclip;
+
+        Vec3f power_marg;
+        Vec3f pos_marg;
+        //bounce & bounceSS
+
+        int32 BC = -1;
+        int32 BCSS = -1;
+        int32 BCSS_noclip = -1;
+        int32 BC_M = -1;
+        int32 BC_M_NL = -1; // no LT
+
+        int handler = -1;
+
+        void setPathInfo(int32 b, int32 bSS)
+        {
+
+            BC = b;
+            BCSS = bSS;
+        }
+
+        void setIndex(uint32 ind)
+        {
+            index = ind;
+        }
+
+        void setPathInfo(int32 b, int32 bSS, int32 noclip, int32 BC_marg, int32 BC_marg_NL)
+        {
+            BC = b;
+            BCSS = bSS;
+            BCSS_noclip = noclip;
+            BC_M = BC_marg;
+            BC_M_NL = BC_marg_NL;
+        }
+
+        bool onSurface() const
+        {
+            return BCSS == 0;
+        }
+
+        // on surf + not just generated
+        bool blocking() const
+        {
+            return BCSS == 0 && BC != 0;
+        }
+
+        bool fromSurface() const
+        {
+            return BCSS_noclip == 1;
+        }
+
+        bool interrupted() const
+        {
+            return BCSS < BC;
+        }
+
+        // even if on surf, could still get back
+        bool access_LT() const
+        {
+            return BCSS_noclip == BC;
+        }
+
+        bool initial() const
+        {
+            return BCSS == 0 && BC == 0;
+        }
+
+        // the same as first_in_path
+        bool initial_inc_LS_() const
+        {
+            int lsiz = extra.LS.key_dirs.size();
+            return BCSS == -lsiz && BC == -lsiz;
+        }
+
+        bool first_in_path() const
+        {
+            return extra.data_bracketL_far == index;
+        }
+
+        bool last_in_path() const
+        {
+            return extra.data_bracketR_far == index;
+        }
+
+        // not on or within LS and not on surface
+        bool trivial() const
+        {
+            return (BCSS > 0) && (BC > 0);
+        }
+
+        bool LS_dims() const
+        {
+            return BCSS < 0;
+        }
+
+        template <SS_or_not SS> int32 b() const
+        {
+            if (SS == X)
+                return BC;
+            else
+                return BCSS;
+        }
+
+        int32 bounce() const
+        {
+            return BC;
+        }
+
+        int32 bounceSS() const
+        {
+            return BCSS;
+        }
+
+        friend ost &operator<<(ost &o1, const PathPhoton &PP)
+        {
+            o1 << " (" << PP.index << "=" << PP.BC << ":" << PP.BCSS << "_" << PP.BCSS_noclip << "~"
+               << PP.BC_M << "^" << PP.BC_M_NL << "} " << PP.extra;
+            return o1;
+        }
+
+        void clear_features()
+        {
+            extra.clear_features();
+        }
+
+        // features may need clearing explicitly, since the data is not re-initialised
+        class extra_feature_blob
+        {
+          public:
+            friend ost &operator<<(ost &o1, const extra_feature_blob &blob)
+            {
+                sst s1;
+
+                s1 << (blob.profile.is_on(EF_LT) ? "Lt" : "__") << (blob.profile.is_on(EF_SF) ? "Sf" : "__")
+                   << (blob.profile.is_on(EF_null) ? "Nu" : "__");
+                if (blob.profile.is_on(EF_null))
+                    s1 << ":" << blob.nvs.size() << " ";
+
+                s1 << (blob.profile.is_on(EF_dangling_using) ? "dU" : "__");
+                if (blob.profile.is_on(EF_dangling_using))
+                {
+                    s1 << ":";
+                    s1 << blob.dangling_using;
+                    s1 << " ";
+                }
+
+                s1 << "|";
+                s1 << (blob.profile.is_on(EF_dangling_store) ? "dS" : "__");
+                if (blob.profile.is_on(EF_dangling_store))
+                {
+                    s1 << ":";
+                    s1 << blob.danglings.size();
+                    s1 << "=";
+                    s1 << blob.dangling_storing;
+                    s1 << " ";
+                }
+
+                if (blob.dangling_index >= 0)
+                {
+                    s1 << "=><";
+                    s1 << blob.dangling_index << ">";
+                }
+
+                return o1 << s1.str();
+            }
+
+            enum extra_feature
+            {
+                EF_brackets = 1 << 0,       /*brackets (between bounces)*/
+                EF_LT = 1 << 1,             /*on light source*/
+                EF_SF = 1 << 2,             /*on surface*/
+                EF_null = 1 << 3,           /*null vertices*/
+                EF_dangling_store = 1 << 4, /*has dangling*/
+                EF_dangling_using = 1 << 5  /*has dangling*/
+            };
+
+            void operator=(const extra_feature_blob &e2)
+            {
+
+                profile = e2.profile;
+                nvs = e2.nvs;
+                danglings = e2.danglings;
+                dangling_index = e2.dangling_index;
+                dangling_using = e2.dangling_using;
+                dangling_storing = e2.dangling_storing;
+
+                int data_LT_dim = e2.data_LT_dim;
+                data_LT = e2.data_LT;
+
+                LS = e2.LS;
+
+                /*Brackets*/
+                data_bracketL = e2.data_bracketL;
+                data_bracketR = e2.data_bracketR;
+
+                /*SURFACE*/
+                data_SF_BS = e2.data_SF_BS;
+                data_SF_norm = e2.data_SF_norm;
+                data_SF_event = e2.data_SF_event;
+            }
+
+            switch_field profile;
+            arr<Medium::NullVertex> nvs;
+            //danglings could have their own null vertices
+            arr<PathPhoton> danglings;
+
+            //for now, we assume we won't use up 31 bits
+            int32 dangling_index = -1;
+            int dangling_using = 0;
+            int dangling_storing = 0;
+
+            /*Light Source*/
+            int data_LT_dim = -1;
+            const Primitive *data_LT = nullptr;
+            Primitive::LS_info LS;
+
+            /*Brackets*/
+            int data_bracketL = -1;
+            int data_bracketR = -1;
+            int data_bracketL_far = -1;
+            int data_bracketR_far = -1;
+
+            /*SURFACE*/
+            const Bsdf *data_SF_BS = nullptr;
+            Vec3f data_SF_norm;
+            SurfaceScatterEvent data_SF_event;
+
+            void clear_features()
+            {
+                profile.clear();
+            }
+
+            void enable_feature(extra_feature ef)
+            {
+                profile.turn_on(ef);
+            }
+
+            void disable_feature(extra_feature ef)
+            {
+                profile.turn_off(ef);
+            }
+
+            void setNV(const arr<Medium::NullVertex> &nvs)
+            {
+                enable_feature(EF_null);
+                this->nvs = nvs;
+            }
+        };
+        extra_feature_blob extra;
+    };
+
+    struct PhotonBeam
+    {
+        Vec3f p0, p1;
+        Vec3f dir;
+        float length;
+        Vec3f power;
+        int bounce;
+        bool valid;
+    };
+
+    struct PhotonPlane0D
+    {
+        Vec3f p0, p1, p2, p3;
+        Vec3f power;
+        Vec3f d1;
+        float l1;
+        int bounce;
+        bool valid;
+
+        Box3f bounds() const
+        {
+            Box3f box;
+            box.grow(p0);
+            box.grow(p1);
+            box.grow(p2);
+            box.grow(p3);
+            return box;
+        }
+    };
+
+    struct DifferentialPhotonPlane_unidir
+    {
+        bool longprim = true;
+        Vec3f p0;
+        Vec3f ep0, ep1;
+        Vec3f d0, d1;
+        Vec3f ep0E, ep1E;
+        float len;
+
+        int bounce;
+        bool valid;
+
+        void longprim_ext()
+        {
+            if (longprim)
+            {
+                len = 1000;
+            }
+        }
+
+        void ext()
+        {
+            d0 = (ep0 - p0).normalized();
+            d1 = (ep1 - p0).normalized();
+
+            ep0E = len * d0 + p0;
+            ep1E = len * d1 + p0;
+        }
+
+        Box3f bounds() const
+        {
+            Box3f box;
+            box.grow(p0);
+            box.grow(ep0E);
+            box.grow(ep1E);
+            box.grow(ep0E + len * d1);
+            return box;
+        }
+    };
+
+    struct DifferentialPhotonPlane_bidir
+    {
+        bool longprim = true;
+        Vec3f p0, p1;
+        Vec3f dir;
+        float len;
+
+        Vec3f LB, LT, RB, RT;
+
+        void longprim_ext()
+        {
+            if (longprim)
+            {
+                len = 1000;
+            }
+        }
+
+        int bounce;
+        bool valid;
+
+        void ext()
+        {
+            LB = p0 - len * dir;
+            LT = p0 + len * dir;
+            RB = p1 - len * dir;
+            RT = p1 + len * dir;
+        }
+
+        Box3f bounds() const
+        {
+            Box3f box;
+            box.grow(LB);
+            box.grow(LT);
+            box.grow(RB);
+            box.grow(RT);
+            return box;
+        }
+    };
+
+    struct PhotonPlane1D
+    {
+        Vec3f p;
+        Vec3f invU, invV, invW;
+        Vec3f center, a, b, c;
+        Vec3f power;
+        Vec3f d1;
+        float l1;
+        float invDet;
+        float binCount;
+        int bounce;
+        bool valid;
+
+        Box3f bounds() const
+        {
+            Box3f box;
+            box.grow(center + a + b + c);
+            box.grow(center - a + b + c);
+            box.grow(center + a - b + c);
+            box.grow(center - a - b + c);
+            box.grow(center + a + b - c);
+            box.grow(center - a + b - c);
+            box.grow(center + a - b - c);
+            box.grow(center - a - b - c);
+            return box;
+        }
+    };
+
+    class differential_disk
+    {
+      public:
+        Vec3f axis_v;
+        Vec3f sweep_v1;
+        Vec3f sweep_v2;
+    };
+
+    /*
+	[]   -- pt
+    ()   -- vct
+    /    -- dir
+*/
+
+    class PP_subpath
+    {
+      public:
+        arr<Vec3f> P;
+        arr<Vec3f> V;
+        arr<Vec3f> D;
+        arr<Vec3f> NSA;
+        arr<float> L;
+
+        bool has_NV = false;
+        ;
+
+        arr<arr<Vec3f>> V_null;
+        arr<arr<Vec3f>> V_NSA_null;
+
+        bool block_info_on = false;
+        arr<bool> blocked;
+
+        bool nonEmpty() const
+        {
+            return P.size() > 0;
+        }
+
+        bool has_edge() const
+        {
+            return V.size() > 0;
+        }
+
+        const Vec3f &lastP() const
+        {
+            return P[P.size() - 1];
+        }
+
+        const Vec3f &lastV() const
+        {
+            return V[V.size() - 1];
+        }
+
+        const Vec3f &lastD() const
+        {
+            return D[D.size() - 1];
+        }
+
+        const Vec3f &firstP() const
+        {
+            return P[0];
+        }
+
+        const Vec3f &firstV() const
+        {
+            return V[0];
+        }
+
+        const Vec3f &firstD() const
+        {
+            return D[0];
+        }
+
+        const Vec3f &operator[](int which)
+        {
+            return P[which];
+        }
+
+        const Vec3f &operator()(int which)
+        {
+            return V[which];
+        }
+
+        const float &operator%(int which)
+        {
+            return L[which];
+        }
+
+        const Vec3f &operator/(int which)
+        {
+            return D[which];
+        }
+
+        const Vec3f &operator^(int which)
+        {
+            return NSA[which];
+        }
+
+        void operator=(const PP_subpath &PPS2)
+        {
+            L = PPS2.L;
+            P = PPS2.P;
+            V = PPS2.V;
+            D = PPS2.D;
+            NSA = PPS2.NSA;
+            has_NV = PPS2.has_NV;
+            V_null = PPS2.V_null;
+            V_NSA_null = PPS2.V_NSA_null;
+
+            blocked = PPS2.blocked;
+            block_info_on = PPS2.block_info_on;
+        }
+
+        PP_subpath(const PP_subpath &PPS2)
+        {
+            *this = PPS2;
+        }
+
+        void clear()
+        {
+            L.clear();
+            P.clear();
+            V.clear();
+            D.clear();
+            NSA.clear();
+            has_NV = false;
+            V_null.clear();
+            V_NSA_null.clear();
+            block_info_on = false;
+            blocked.clear();
+        }
+
+        PP_subpath()
+        {
+            clear();
+        }
+
+        // null vertices (has_NV) not handled here yet
+        void add_P(Vec3f &newpos, Vec3f &newNSA)
+        {
+            P.emplace_back(newpos);
+            NSA.emplace_back(newNSA);
+            if (P.size() > 1)
+            {
+                V.emplace_back(P.back() - P[P.size() - 2]);
+                D.emplace_back(V.back().normalized());
+                L.emplace_back(V.back().length());
+            }
+        }
+
+        void add_P(Vec3f &newpos, Vec3f &newNSA, bool is_blocked)
+        {
+            P.emplace_back(newpos);
+            NSA.emplace_back(newNSA);
+            if (P.size() > 1)
+            {
+                V.emplace_back(P.back() - P[P.size() - 2]);
+                D.emplace_back(V.back().normalized());
+                L.emplace_back(V.back().length());
+                blocked.emplace_back(is_blocked);
+            }
+        }
+    };
+
+    class PP_PRIM
+    {
+      public:
+        class dbg_structure
+        {
+            arr<PhotonBeam> dbg_beams;
+            arr<PathPhoton> dbg_points;
+            bool ready = false;
+        };
+        dbg_structure diagram;
+
+        static bool GLOBALS_READY;
+        static Box3f BMAX, BSCENE;
+        static PP *RAW_ARRAY;
+        static PhotonPrimitiveSettings *SETTINGS;
+        static UniformPathSampler smp;
+
+        Vec3f power = Vec3f(1.0f);
+
+        int index_head = -1;
+
+        const Vec3f &KV(int which)
+        {
+            int index_in_PSP = cache.prim->KV_pos_list[which];
+            return PSP(index_in_PSP);
+        }
+
+        const Vec3f &KV_geo(int which)
+        {
+            int index_in_PSP = cache.prim->KV_pos_list[which];
+            return PSP_geo(index_in_PSP);
+        }
+
+        bool am_I(PhotonPrimitiveSettings::Primitive_Description::property PT)
+        {
+            if (valid)
+                return PhotonPrimitiveSettings::Primitive_Description::is(cache.ptype, PT);
+        }
+
+        int index_on_array;
+
+        PP_subpath PSP;
+        // geometry shape
+        // mainly for LS
+        PP_subpath PSP_geo;
+
+        // geo orig of the prim
+        Vec3f orig;
+        // first V involved, always unchanged
+        Vec3f head;
+
+        //todo: new attrib, not handled yet
+        bool dangling = false;
+
+        int B;
+
+        //# of terms shifted
+        int dim()
+        {
+            return cache.key_indices_in_PSP.size();
+        }
+
+        const Vec3f &keypos(int which)
+        {
+            return PSP[cache.key_indices_in_PSP[which]];
+        }
+
+        PP_PRIM() {}
+
+        Box3f get_bbox()
+        {
+            return cache.bbox;
+        }
+
+        class intersection_solution
+        {
+          public:
+            class intersection_root
+            {
+              public:
+                Vec3f point;
+                float raydist;
+
+                /* plane: hitUV
+            // parallelepiped: hitUVW
+            // sphere/cone: dir
+            // cylinder: dist + dir */
+                Vec4f UVWT;
+
+                // mostly unused
+                Vec3f norm;
+
+                intersection_root()
+                {
+                    point = Vec3f(0.0f);
+                    raydist = 0.0f;
+                    UVWT = Vec4f(0.0f);
+                    norm = Vec3f(0.0f);
+                }
+
+                intersection_root(const intersection_root &ir)
+                {
+                    this->point = ir.point;
+                    this->raydist = ir.raydist;
+                    this->UVWT = ir.UVWT;
+                    this->norm = ir.norm;
+                }
+
+                // a sol for plane
+                intersection_root(Vec3f &point, float &raydist, Vec2f &Q_UV)
+                {
+                    this->point = point;
+                    this->raydist = raydist;
+                    this->UVWT[0] = Q_UV[0];
+                    this->UVWT[1] = Q_UV[1];
+                }
+
+                // a sol for volume
+                intersection_root(Vec3f &point, float &raydist, Vec3f &PP_UVT)
+                {
+                    this->point = point;
+                    this->raydist = raydist;
+                    this->UVWT[0] = PP_UVT[0];
+                    this->UVWT[1] = PP_UVT[1];
+                    this->UVWT[2] = PP_UVT[2];
+                }
+
+                // a general sol that uses 4D
+                intersection_root(Vec3f &point, float &raydist, Vec4f &any_UVTW)
+                {
+                    this->point = point;
+                    this->raydist = raydist;
+                    this->UVWT = any_UVTW;
+                }
+            };
+
+            arr<intersection_root> roots;
+
+            void clear()
+            {
+                roots.clear();
+            }
+
+            intersection_solution() {}
+            intersection_solution(intersection_solution &&tmp) : roots(std::move(tmp.roots)) {}
+
+            // only for Q for now
+            void addroot(Vec3f &point, float &dist, Vec2f &UV)
+            {
+                roots.emplace_back(intersection_root(point, dist, UV));
+            }
+
+            // only for PP for now
+            void addroot(Vec3f &point, float &dist, Vec3f &UVT)
+            {
+                roots.emplace_back(intersection_root(point, dist, UVT));
+            }
+
+            void addroot(Ray &ray, float &dist, Vec2f &UV)
+            {
+                roots.emplace_back(intersection_root(ray.pos() + ray.dir() * dist, dist, UV));
+            }
+
+            void addroot(Vec3f &orig, Vec3f &d1, Vec3f &d2, float &dist, Vec2f &UV,
+                         PhotonMapSettings::Primitive_Description::PrimType pt)
+            {
+                // for now only has UV for planes
+                assert(pt == PrimEnum::PRIM2_PLANE);
+
+                if (pt == PrimEnum::PRIM2_PLANE)
+                    roots.emplace_back(intersection_root(orig + d1 * UV[0] + d2 * UV[1], dist, UV));
+            }
+        };
+
+        // YANG's code
+        static inline bool inter_ucube_at_orig(const Vec3f &o, const Vec3f &d, float &tMin, float &tMax)
+        {
+            bool isMinSet = false;
+            bool isMaxSet = false;
+
+            for (int dim = 0; dim < 3; ++dim)
+            {
+                float p0 = 0.f, p1 = 1.f;
+
+                Vec3f n = Vec3f(0.f, 0.f, 0.f);
+                n[dim] = 1.f;
+
+                float f = d.dot(n);
+
+                if (std::abs(f) > 1e-5f)
+                {
+                    float t1 = (p0 - o[dim]) / f;
+                    float t2 = (p1 - o[dim]) / f;
+
+                    if (t1 > t2)
+                    {
+                        std::swap(t1, t2);
+                    }
+                    if (!isMinSet || t1 > tMin)
+                    {
+                        tMin = t1;
+                        isMinSet = true;
+                    }
+                    if (!isMaxSet || t2 < tMax)
+                    {
+                        tMax = t2;
+                        isMaxSet = true;
+                    }
+
+                    if (tMin > tMax || tMax < 0.0f)
+                    {
+                        return false;
+                    }
+                }
+                else if (o[dim] < 0.0 || o[dim] > 1.0)
+                {
+                    return false;
+                }
+            }
+
+            if (tMin < 0.0)
+            {
+                // ray origin inside cube?
+                tMin = 0.0;
+            }
+            return true;
+        }
+
+        // UV: not 0-1, just length
+        intersection_solution intersect(const Ray &in_eyeray, float tMin, float tMax) const
+        {
+            intersection_solution sol;
+
+            switch (cache.ptype)
+            {
+            case PrimEnum::PRIM3_SSPHERE:
+            case PrimEnum::PRIM2_SPHERE:
+            {
+                //should have matrix
+                assert(this->features.profile.is_on(this->features.EF_matrix));
+
+                const Mat4f &WL = features.feature_matrix.W2L;
+                const Mat4f &LW = features.feature_matrix.L2W;
+
+                Vec3f eyepos_transformed = WL * in_eyeray.pos();
+                Vec3f dir_transformed = WL.transformVector(in_eyeray.dir()).normalized();
+
+                float A = dir_transformed.dot(dir_transformed);
+                float B = 2.f * dir_transformed.dot(eyepos_transformed);
+                float C = eyepos_transformed.dot(eyepos_transformed) - key_vct(0).lengthSq();
+
+                float delta = pow(B, 2) - 4.f * A * C;
+
+                if (delta < 0 || A == 0.f)
+                {
+                    return sol;
+                }
+
+                delta = sqrtf(delta);
+                float nomi = (2.f * A);
+
+                Vec2f t12;
+
+                t12[0] = (-B + delta) / nomi;
+                t12[1] = (-B - delta) / nomi;
+
+                // first hit farther
+                if (t12[0] > t12[1])
+                {
+                    std::swap(t12[0], t12[1]);
+                }
+
+                for (int i = 0; i < 2; i++)
+                {
+                    if (t12[i] < tMin || t12[i] > tMax)
+                        continue;
+
+                    Vec3f plocal = (eyepos_transformed + t12[i] * dir_transformed);
+
+                    Vec3f p = LW * plocal;
+
+                    // no compression, keep dist
+                    sol.addroot(p, t12[i], plocal);
+                }
+
+                return sol;
+                break;
+            }
+            case PrimEnum::PRIM2_CONE:
+            {
+
+                assert(this->features.profile.is_on(this->features.EF_matrix));
+
+                const Mat4f &WL = features.feature_matrix.W2L;
+                const Mat4f &LW = features.feature_matrix.L2W;
+
+                Vec3f eyepos_transformed = WL * in_eyeray.pos();
+                Vec3f eyedir_transformed = WL.transformVector(in_eyeray.dir()).normalized();
+
+                Vec3f R_transformed = WL.transformVector(key_vct_geo(0));
+
+                //both global space
+                float rad = key_vct_geo(0).cross(cache.dprev).length();
+                float TAN = abs(rad / key_vct_geo(0).dot(cache.dprev));
+                float TAN2 = TAN * TAN;
+
+                Vec2f dir_T_flat = eyedir_transformed.yz();
+                Vec2f eyepos_T_flat = eyepos_transformed.yz();
+
+                float A = dir_T_flat.dot(dir_T_flat) - eyedir_transformed.x() * eyedir_transformed.x() * TAN2;
+                float B = 2.f * dir_T_flat.dot(eyepos_T_flat) -
+                          eyedir_transformed.x() * eyepos_transformed.x() * 2.0 * TAN2;
+                float C =
+                    eyepos_T_flat.dot(eyepos_T_flat) - eyepos_transformed.x() * eyepos_transformed.x() * TAN2;
+
+                float delta = pow(B, 2) - 4.f * A * C;
+
+                if (delta < 0 || A == 0.f)
+                {
+                    return sol;
+                }
+
+                delta = sqrtf(delta);
+                float nomi = (2.f * A);
+
+                Vec2f t12;
+
+                t12[0] = (-B + delta) / nomi;
+                t12[1] = (-B - delta) / nomi;
+
+                // first hit farther
+                if (t12[0] > t12[1])
+                {
+                    std::swap(t12[0], t12[1]);
+                }
+
+                float len = key_vct_geo(0).length();
+
+                for (int i = 0; i < 2; i++)
+                {
+                    if (t12[i] < tMin || t12[i] > tMax)
+                        continue;
+
+                    Vec3f plocal = (eyepos_transformed + t12[i] * eyedir_transformed);
+
+                    Vec3f p = LW * plocal;
+
+                    if (plocal.length() > len)
+                        continue;
+
+                    // no compression, keep dist
+                    sol.addroot(p, t12[i], plocal);
+                }
+
+                return sol;
+                break;
+            }
+            case PrimEnum::PRIM2_CYLINDER:
+            {
+
+                assert(this->features.profile.is_on(this->features.EF_matrix));
+
+                const Mat4f &WL = features.feature_matrix.W2L;
+                const Mat4f &LW = features.feature_matrix.L2W;
+
+                Vec3f eyepos_transformed = WL * in_eyeray.pos();
+                Vec3f R_transformed = WL.transformVector(in_eyeray.dir());
+                Vec3f dir_transformed = R_transformed.normalized();
+
+                float R = R_transformed.cross(key_dir(0)).length();
+
+                Vec2f dir_flat = dir_transformed.yz();
+                Vec2f eyepos_flat = eyepos_transformed.yz();
+
+                float A = dir_flat.dot(dir_flat);
+                float B = 2.f * dir_flat.dot(eyepos_flat);
+                float C = eyepos_flat.dot(eyepos_flat) - R * R;
+
+                float delta = pow(B, 2) - 4.f * A * C;
+
+                if (delta < 0 || A == 0.f)
+                {
+                    return sol;
+                }
+
+                delta = sqrtf(delta);
+                float nomi = (2.f * A);
+
+                Vec2f t12;
+
+                t12[0] = (-B + delta) / nomi;
+                t12[1] = (-B - delta) / nomi;
+
+                // first hit farther
+                if (t12[0] > t12[1])
+                {
+                    std::swap(t12[0], t12[1]);
+                }
+
+                for (int i = 0; i < 2; i++)
+                {
+                    if (t12[i] < tMin || t12[i] > tMax)
+                        continue;
+
+                    Vec3f plocal = (eyepos_transformed + t12[i] * dir_transformed);
+
+                    Vec3f p = LW * plocal;
+
+                    // no compression, keep dist
+                    sol.addroot(p, t12[i], plocal);
+                }
+
+                return sol;
+                break;
+            }
+
+            case PrimEnum::PRIM2_DISK:
+            {
+                Vec3f norm = cache.const_JAC_portion_orig_prim.normalized();
+
+                //TODO: for now, not adding UV
+
+                float dist = (in_eyeray.pos() - orig).dot(norm) / (-in_eyeray.dir().dot(norm));
+
+                if (dist <= 0)
+                    return sol;
+                if (!finite(dist))
+                    return sol;
+                if (dist <= tMin || dist >= tMax)
+                    return sol;
+
+                Vec3f hitP = in_eyeray.pos() + dist * in_eyeray.dir();
+                Vec3f hitV = hitP - orig;
+
+                if (hitV.length() <= key_vct_geo(0).length())
+                {
+                    sol.addroot(hitP, dist, Vec2f(0.0f));
+                    return sol;
+                }
+
+                return sol;
+                break;
+            }
+            case PrimEnum::PRIM2_PLANE:
+            {
+
+                Vec3f norm = (key_dir(0).cross(key_dir(1))).normalized();
+
+                float dist = (in_eyeray.pos() - orig).dot(norm) / (-in_eyeray.dir().dot(norm));
+
+                if (dist <= 0)
+                    return sol;
+
+                if (!finite(dist))
+                    return sol;
+
+                if (dist <= tMin || dist >= tMax)
+                    return sol;
+
+                Vec3f hitP = in_eyeray.pos() + dist * in_eyeray.dir();
+                Vec2f out_hitUV(-1, -1);
+
+                float XX = (hitP - orig).dot(key_dir(0));
+                Vec3f Yaxis = norm.cross(key_dir(0)).normalized();
+                float YY = (hitP - orig).dot(Yaxis);
+
+                float costheta = key_dir(1).dot(key_dir(0));
+                float sintheta = abs(key_dir(0).cross(key_dir(1)).length());
+
+                out_hitUV[0] = XX - YY * costheta / sintheta;
+                out_hitUV[1] = YY / sintheta;
+
+                // TODO: long version not handled yet
+                if ((out_hitUV[0] >= 0) && (out_hitUV[1] >= 0))
+                {
+                    if ((out_hitUV[0] <= key_vct_geo(0).length()) &&
+                        (out_hitUV[1] <= key_vct_geo(1).length()))
+                    {
+                        sol.addroot(hitP, dist, out_hitUV);
+                        return sol;
+                    }
+                }
+
+                return sol;
+                break;
+            }
+
+            case PrimEnum::PRIM3_PARALLELEPIPED:
+            {
+                //should have matrix
+                assert(this->features.profile.is_on(this->features.EF_matrix));
+
+                const Mat4f &WL = features.feature_matrix.W2L;
+                const Mat4f &LW = features.feature_matrix.L2W;
+
+                float tmin = -1, tmax = -1;
+
+                Vec3f eyepos_transformed = WL * in_eyeray.pos();
+                Vec3f dir_transformed = WL.transformVector(in_eyeray.dir()).normalized();
+
+                if (inter_ucube_at_orig(eyepos_transformed, dir_transformed, tmin, tmax))
+                {
+
+                    if (tMin <= tMax)
+                    {
+                        //face info stored in 3D UV
+                        //length will change, multiply to get pos
+
+                        Vec3f pmin_coord_in_ucube = eyepos_transformed + dir_transformed * tmin;
+                        Vec3f pmax_coord_in_ucube = eyepos_transformed + dir_transformed * tmax;
+
+                        Vec3f pmin = LW * pmin_coord_in_ucube;
+                        Vec3f pmax = LW * pmax_coord_in_ucube;
+
+                        float tminw = (pmin - in_eyeray.pos()).length();
+                        float tmaxw = (pmax - in_eyeray.pos()).length();
+
+                        sol.addroot(pmin, tminw, pmin_coord_in_ucube);
+                        sol.addroot(pmax, tmaxw, pmax_coord_in_ucube);
+
+                        // TODO: not handling the 1-solution case for now
+
+                        return sol;
+                    }
+                }
+
+                return sol;
+                break;
+            }
+
+            case PrimEnum::DPRIM2_VE:
+            {
+
+                float dist = (in_eyeray.pos() - PSP.P[0]).dot(cache.const_JAC_portion_orig_prim) /
+                             (-in_eyeray.dir().dot(cache.const_JAC_portion_orig_prim));
+
+                Vec2f UV(0.0f);
+
+                if (dist <= 0)
+                    return sol;
+
+                if (dist > 95279527)
+                    return sol;
+
+                if (dist <= tMin || dist >= tMax)
+                    return sol;
+
+                Vec3f hitP = in_eyeray.pos() + dist * in_eyeray.dir();
+
+                Vec3f p0_e0 = features.feature_edge.E.p0 - PSP.P[0];
+
+                UV = decomp_2D(PSP.P[0], p0_e0.normalized(), features.feature_edge.E.dir_, hitP);
+
+                sol.addroot(hitP, dist, UV);
+
+                return sol;
+
+                break;
+            }
+
+            case PrimEnum::DPRIM2_VVT:
+            {
+
+                float dist = (in_eyeray.pos() - PSP.P[0]).dot(cache.const_JAC_portion_orig_prim) /
+                             (-in_eyeray.dir().dot(cache.const_JAC_portion_orig_prim));
+
+                Vec2f UV(0.0f);
+
+                if (dist <= 0)
+                    return sol;
+
+                if (dist > 95279527)
+                    return sol;
+
+                if (dist <= tMin || dist >= tMax)
+                    return sol;
+
+                Vec3f hitP = in_eyeray.pos() + dist * in_eyeray.dir();
+
+                Vec3f p0_EV = features.feature_edge.E.marked_pos - PSP.P[0];
+
+                UV = decomp_2D(PSP.P[0], p0_EV.normalized(), PSP.D[0], hitP);
+
+                sol.addroot(hitP, dist, UV);
+
+                return sol;
+
+                break;
+            }
+            }
+        }
+
+        // smp is a shared static sampler; thread-safety not verified
+
+        static Vec3f gen_seg(float exp_dist)
+        {
+            float dist = -std::log(1.0f - smp.next1D()) * exp_dist;
+            Vec3f dir = SampleWarp::uniformSphere(smp.next2D());
+            return dir * dist;
+        }
+
+        Vec3f eval_dprev()
+        {
+            if (SETTINGS->is_on<PhotonPrimitiveSettings::switch_STYLE>(
+                    PhotonPrimitiveSettings::ST_LS_dprev_fixed))
+                return Vec3f(0.0f, -1.0f, 0.0f);
+
+            // has left vtx
+            if (RAW_ARRAY[index_head].index_pathL < index_head)
+                return RAW_ARRAY[index_head - 1].dir;
+
+            // if no left vtx, still initialised using -Y
+            return Vec3f(0.0f, -1.0f, 0.0f);
+        }
+
+        void update_dprev()
+        {
+            cache.dprev = eval_dprev();
+        }
+
+        void initialize_cache()
+        {
+            // comb_prim_id should be filled already
+
+            cache.comb = SETTINGS->surf_Policy.nth_comb(comb_prim_id[0]);
+            cache.prim = cache.comb->nth_prim(comb_prim_id[1]);
+            cache.ptype = cache.prim->o_primtype();
+
+            // these need to be set early
+            index_head = index_on_array - cache.prim->o_seg_involved();
+
+            // dim not segs involved
+            // UV plane: 3 segs involved, 2D
+            for (int i = 0; i < cache.prim->o_dim(); i++)
+            {
+                cache.key_indices_in_PSP.emplace_back(cache.key_index_in_PSP(i));
+            }
+
+            update_dprev();
+
+            cache.initialized = true;
+        }
+
+        void _update_constJAC()
+        {
+            switch (cache.prim->o_primtype())
+            {
+            case PRIM2_PLANE:
+                cache.const_JAC_portion_orig_prim = KV(0).normalized().cross(KV(1).normalized());
+                break;
+
+            case PRIM3_PARALLELEPIPED:
+                cache.const_JAC_portion_orig_prim =
+                    Vec3f(KV(0).normalized().cross(KV(1).normalized()).dot(KV(2).normalized()));
+                break;
+
+            case PRIM2_DISK:
+
+                // LS dim
+                // LS: can't tilt
+                // tilted ones need a diff parameterization
+                // the way Z val changes is diff
+                Vec3f dprev = cache.dprev;
+
+                cache.const_JAC_portion_orig_prim = dprev.cross(key_dir(0)).normalized();
+                break;
+
+            case DPRIM2_VE:
+                assert(features.profile.is_on(features.EF_edge));
+
+                Vec3f LStoE = features.feature_edge.E.p0 - PSP.P[0];
+
+                cache.const_JAC_portion_orig_prim = LStoE.cross(features.feature_edge.E.dir_).normalized();
+                break;
+
+            case DPRIM2_VVT:
+                assert(features.profile.is_on(features.EF_edge));
+                cache.const_JAC_portion_orig_prim =
+                    PSP.D[0].cross(features.feature_edge.E.p0 - PSP.P[0]).normalized();
+                break;
+            }
+        }
+
+        arr<Vec3f> kv_from_root(intersection_solution::intersection_root &CR) const
+        {
+
+            arr<Vec3f> kvs;
+            Vec3f &phit = CR.point;
+
+            switch (cache.prim->o_primtype())
+            {
+            case PrimEnum::DPRIM2_VE:
+                kvs.emplace_back(phit - PSP.P[0]);
+                break;
+
+            case PrimEnum::DPRIM2_VVT:
+            {
+
+                auto inter_plane = [&](Vec3f &hitP_LS, Vec2f &uv, float &dist) -> bool
+                {
+                    Ray rback;
+
+                    Vec3f norm_LT =
+                        -features.feature_LS.key_dirs[0].cross(features.feature_LS.key_dirs[1]).normalized();
+
+                    ray_from_to(phit, features.feature_edge.E.marked_pos, rback);
+
+                    rback.setFarT(INFINITY);
+
+                    dist = (PSP_geo.P[0] - phit).dot(norm_LT) / (rback.dir().dot(norm_LT));
+
+                    float cos1_dbg = (PSP_geo.P[0] - phit).dot(norm_LT);
+                    float cos2_dbg = rback.dir().dot(norm_LT);
+
+                    if (!finite(dist))
+                        return false;
+                    if (dist <= 0)
+                        return false;
+
+                    hitP_LS = rback.pos() + dist * rback.dir();
+
+                    uv = decomp_2D(features.feature_LS.origin, features.feature_LS.key_dirs[0],
+                                   features.feature_LS.key_dirs[1], hitP_LS);
+
+                    if (uv[1] < 0 || uv[1] > features.feature_LS.key_vectors[1].length())
+                        return false;
+
+                    return true;
+                };
+
+                Vec3f backhitP;
+                Vec2f uv;
+                float dist;
+
+                if (inter_plane(backhitP, uv, dist))
+                {
+                    // testing range in Contrib not here
+                    {
+                        kvs.emplace_back(uv[1] * features.feature_LS.key_dirs[1]);
+                        kvs.emplace_back(phit - backhitP);
+                    }
+                }
+
+                break;
+            }
+
+            case PrimEnum::PRIM2_PLANE:
+                Vec2f UV = decomp_2D(orig, key_dir(0), key_dir(1), phit);
+                kvs.emplace_back(key_dir(0) * UV[0]);
+                kvs.emplace_back(key_dir(1) * UV[1]);
+                break;
+
+            case PrimEnum::PRIM2_CONE:
+            case PrimEnum::PRIM2_DISK:
+            case PrimEnum::PRIM2_SPHERE:
+                Vec3f hitV = phit - orig;
+                kvs.emplace_back(hitV);
+                break;
+
+            case PrimEnum::PRIM2_CYLINDER:
+                // orig and matrix orig are 2 different points
+                Vec3f Ralong = key_vct_geo(1).dot(key_dir(0)) * key_dir(0);
+                Vec3f Valong = phit - (orig + Ralong);
+
+                kvs.emplace_back(Valong);
+                kvs.emplace_back(phit - Valong - orig);
+
+                break;
+
+            case PrimEnum::PRIM3_PARALLELEPIPED:
+                kvs.emplace_back(key_dir(0) * CR.UVWT[0]);
+                kvs.emplace_back(key_dir(1) * CR.UVWT[1]);
+                kvs.emplace_back(key_dir(2) * CR.UVWT[2]);
+
+                break;
+            }
+
+            return kvs;
+        }
+
+        //in most cases, it should come with a sol
+        //special case: solid prims
+        arr<Vec3f> kv_from_phit(Vec3f &CP) const
+        {
+            arr<Vec3f> kvs;
+
+            switch (cache.prim->o_primtype())
+            {
+            case PrimEnum::PRIM3_SSPHERE:
+            {
+                assert(features.profile.is_on(features.EF_matrix));
+
+                kvs.emplace_back(CP - orig);
+
+                break;
+            }
+
+            case PrimEnum::PRIM3_PARALLELEPIPED:
+            {
+                assert(features.profile.is_on(features.EF_matrix));
+
+                Vec3f UVW = features.feature_matrix.W2L * CP;
+
+                kvs.emplace_back(key_vct_geo(0) * UVW[0]);
+                kvs.emplace_back(key_vct_geo(1) * UVW[1]);
+                kvs.emplace_back(key_vct_geo(2) * UVW[2]);
+
+                break;
+            }
+            }
+
+            return kvs;
+        }
+
+        bool generate_path_root(const PP_subpath &porig, PP_subpath &ptarget,
+
+                                intersection_solution::intersection_root &cur_root,
+
+                                PhotonPrimitiveSettings::Primitive_Description *PD) const
+        {
+            ptarget.clear();
+
+            Vec3f curpos = porig.firstP();
+
+            arr<Vec3f> vcts = PSP.V;
+
+            arr<Vec3f> KVs_replace = kv_from_root(cur_root);
+
+            if (KVs_replace.empty())
+                return false;
+
+            for (int curKV = 0; curKV < PD->KV_pos_list.size(); curKV++)
+                vcts[PD->KV_pos_list[curKV]] = KVs_replace[curKV];
+
+            ptarget.add_P(curpos, Vec3f(1.0f));
+
+            for (auto curseg : vcts)
+            {
+                curpos += curseg;
+                ptarget.add_P(curpos, Vec3f(1.0f));
+            }
+
+            Vec3f hitp_recons = ptarget.lastP();
+            Vec3f hitp_orig = cur_root.point;
+
+            return true;
+        }
+
+        void generate_path_hitpoint(const PP_subpath &porig, PP_subpath &ptarget,
+
+                                    Vec3f cur_point,
+
+                                    PhotonPrimitiveSettings::Primitive_Description *PD) const
+        {
+            ptarget.clear();
+
+            Vec3f curpos = porig.firstP();
+
+            arr<Vec3f> vcts = PSP.V;
+
+            arr<Vec3f> KVs_replace = kv_from_phit(cur_point);
+
+            for (int curKV = 0; curKV < PD->KV_pos_list.size(); curKV++)
+                vcts[PD->KV_pos_list[curKV]] = KVs_replace[curKV];
+
+            ptarget.add_P(curpos, Vec3f(1.0f));
+
+            for (auto curseg : vcts)
+            {
+                curpos += curseg;
+                ptarget.add_P(curpos, Vec3f(1.0f));
+            }
+        }
+
+        inline void prep_matrix(Vec3f &dx, Vec3f &dy, Vec3f &dz, Vec3f &orig)
+        {
+            features.add_MAT(dx, dy, dz, orig);
+        }
+
+        inline void update_cache_bbox()
+        {
+            cache.bbox = bbox();
+        }
+
+        // TODO: visualize the frame
+        // dbg info depending on type of prim
+        void update_dbg_frame()
+        {
+            if (!SETTINGS->is_on<PhotonPrimitiveSettings::switch_DEBUG>(
+                    PhotonPrimitiveSettings::switch_DEBUG::D_viz_skeleton))
+            {
+                this->diagram;
+            }
+            // assuming type already found
+            switch (cache.ptype)
+            {
+            case PrimEnum::DPRIM2_VE:
+            {
+            }
+            }
+        }
+
+        // precompute: already assumed to be a valid (non-skipping)
+        void precompute(int which_strat, int which_prim, int I_curbounce)
+        {
+            valid = false;
+            if (RAW_ARRAY[I_curbounce].b() < 0)
+                return;
+
+            float sigmaj = 1.0f;
+            auto fill_data = [&]() -> void
+            {
+                comb_prim_id[0] = which_strat;
+                comb_prim_id[1] = which_prim;
+                B = RAW_ARRAY[I_curbounce].b();
+            };
+
+            fill_data();
+            index_on_array = RAW_ARRAY[I_curbounce].index;
+            initialize_cache();
+            //now cache has prim info
+            if (index_head < 0)
+                return;
+
+            // TODO: mid-LS photons need extra work here
+            power = RAW_ARRAY[I_curbounce - cache.prim->o_seg_involved()].power;
+
+            auto generate_subpath = [&]() -> void
+            {
+                PSP.clear();
+                PSP_geo.clear();
+
+                // vnum not pnum
+                // # of segs
+                int subp_segnum = cache.comb->o_segs_involved();
+                Vec3f initial_P = RAW_ARRAY[I_curbounce - subp_segnum].pos;
+
+                int has_M = 0;
+                // find the first non-marg edge
+                // anything before that is orig copy for PSP
+                // not necessarily for PSP_geo
+                // TODO: the PSP_geo case is not handled properly yet
+                //this2next_Marginalizable: next seg in main path is already M
+                for (has_M = 0; has_M < subp_segnum; has_M++)
+                {
+                    PP &curP = RAW_ARRAY[I_curbounce - subp_segnum + has_M];
+
+                    if (!curP.this2next_Marginalizable)
+                        break;
+                }
+                // no break: all has_M
+
+                //hasM: use orig
+                //else:retrace
+
+                PSP.add_P(initial_P, Vec3f(1.0f));
+                PSP_geo.add_P(initial_P, Vec3f(1.0f));
+
+                // vertices in PSP_geo doesn't really mean anything
+                // only use segments
+
+                // on LS: still not meaning extending everything
+                // extending all the analytical dims
+
+                // LS is the only case with geo edge not matching photon edge
+                for (int xx = 1; xx < has_M + 1; xx++)
+                {
+                    PP &curP = RAW_ARRAY[I_curbounce - subp_segnum + xx];
+                    PP &prevP = RAW_ARRAY[I_curbounce - subp_segnum + xx - 1];
+
+                    //path: marg, directly add
+                    PSP.add_P(curP.pos, Vec3f(1.0f));
+                    // geo: regardless of marg or not, LS needs special handling
+                    // LS dims
+
+                    if (curP.BC <= 0)
+                    {
+
+                        if (cache.prim->index_in_PSP_collection.find(xx - 1) !=
+                            cache.prim->index_in_PSP_collection.end())
+                            PSP_geo.add_P(PSP_geo.lastP() + prevP.LT_seg, Vec3f(1.0f));
+                        else
+                            PSP_geo.add_P(PSP_geo.lastP() + prevP.dir * prevP.length_marg, Vec3f(1.0f));
+                    }
+                    else
+                    // normal dims
+                    // starting from LS photon,
+                    {
+                        //todo: length_marg not set right yet
+                        //for now, just use stored vct
+                        PSP_geo.add_P(PSP_geo.lastP() + prevP.vct, Vec3f(1.0f));
+                    }
+                }
+
+                // no marg V added yet
+
+                Vec3f curpos, curpos_geo;
+                {
+
+                    curpos = PSP.lastP();
+                    curpos_geo = PSP_geo.lastP();
+                }
+
+                if (has_M < subp_segnum)
+                    dangling = true;
+                else
+                    dangling = false;
+
+                // non-marg
+                for (int xx = has_M; xx < subp_segnum; xx++)
+                {
+                    // first break: dist only
+                    if (xx == has_M)
+                    {
+                        Vec3f dir = RAW_ARRAY[I_curbounce - subp_segnum + xx].dir;
+                        float dist = RAW_ARRAY[I_curbounce - subp_segnum + xx].length_marg;
+
+                        Vec3f curV = dir * dist;
+                        curpos = curpos + curV;
+                        curpos_geo = curpos_geo + curV;
+                    }
+                    // anything after: complete retrace & make them marginalizable
+                    else
+                    {
+                        Vec3f curV = gen_seg(1.0 / sigmaj);
+                        curpos = curpos + curV;
+                        curpos_geo = curpos_geo + curV;
+                    }
+
+                    PSP.add_P(curpos, Vec3f(1.0f));
+                    PSP_geo.add_P(curpos_geo, Vec3f(1.0f));
+                }
+
+                Vec3f pos_origin = PSP.lastP();
+                // adjust based on lastP to find orig
+
+                //extra property: V_involved
+                for (auto cur_ksi_pos : cache.prim->ksi_pos_collection)
+                {
+                    pos_origin -= PSP.V[PSP.V.size() + cur_ksi_pos];
+                }
+
+                Vec3f pos_origin_geo_verify = PSP_geo.lastP();
+                // adjust based on lastP in geo to find orig
+
+                //extra property: V_involved
+                for (auto cur_ksi_pos : cache.prim->ksi_pos_collection)
+                {
+                    pos_origin_geo_verify -= PSP_geo.V[PSP_geo.V.size() + cur_ksi_pos];
+                }
+                //orig: always remove GEO boundaries
+
+                orig = pos_origin;
+
+                // shape set, now add matrix
+                switch (cache.ptype)
+                {
+                case PrimEnum::PRIM3_PARALLELEPIPED:
+                    // the only case that needs scaling
+                    prep_matrix(PSP_geo.V[0], PSP_geo.V[1], PSP_geo.V[2], orig);
+                    break;
+
+                    // 1-bounce ESTs
+                case PrimEnum::PRIM3_SSPHERE:
+                case PrimEnum::PRIM2_SPHERE:
+                case PrimEnum::PRIM2_CONE:
+                {
+                    Vec3f dx = cache.dprev;
+
+                    Vec3f dy = dx.cross(PSP.D[0]).normalized();
+                    Vec3f dz = dx.cross(dy).normalized();
+
+                    prep_matrix(dx, dy, dz, orig);
+
+                    break;
+                }
+
+                case PrimEnum::PRIM2_CYLINDER:
+                {
+                    // use the actual origin:
+                    // not the orig vtx onpath, move along Z to make cylinder start at 0
+
+                    Vec3f dx = cache.dprev;
+                    Vec3f dy = dx.cross(PSP.D[0]).normalized();
+                    Vec3f dz = dx.cross(dy).normalized();
+
+                    Vec3f cone_cap = dx * dx.dot(PSP.V[1]);
+
+                    prep_matrix(dx, dy, dz, orig + cone_cap);
+
+                    break;
+                }
+
+                case PrimEnum::DPRIM2_VE:
+                case PrimEnum::DPRIM2_VVT:
+                {
+                    // edge stored on index_tail
+                    assert(RAW_ARRAY[index_head + cache.prim->o_seg_involved()].features.profile.is_on(
+                        features.EF_edge));
+                    features.add_EDGE(
+                        RAW_ARRAY[index_head + cache.prim->o_seg_involved()].features.feature_edge.E);
+
+                    break;
+                }
+                }
+
+                update_cache_bbox();
+
+                update_dbg_frame();
+
+                valid = true;
+            };
+
+            generate_subpath();
+
+            valid = true;
+
+            // have access to LS
+            if (RAW_ARRAY[I_curbounce - cache.prim->o_seg_involved()].features.has_feature(
+                    feature_blob::EF_LT))
+            {
+                this->features.add_LS(
+                    RAW_ARRAY[I_curbounce - cache.prim->o_seg_involved()].features.feature_LS);
+            }
+
+            _update_constJAC();
+
+            // handling constJAC
+            // actually more like: N term in the jac comp
+        }
+
+        void precompute_diff_photon_uni(PP *ref_PP, PP *ref_PP2, PrimEnum PTYP)
+        {
+
+            index_head = ref_PP->index;
+
+            features.enable_feature(features.EF_edge);
+            features.feature_edge.E = ref_PP->E;
+
+            PrimEnum PE = PTYP;
+
+            valid = false;
+
+            if (PE == PrimEnum::DPRIM2_VE)
+            {
+                cache.ptype = PrimEnum::DPRIM2_VE;
+
+                features.feature_JAC.constNormal =
+                    (ref_PP->E.p0 - ref_PP->pos).cross((ref_PP->E.p1 - ref_PP->pos)).normalized();
+
+                B = ref_PP->BC + 1;
+
+                PSP.add_P(ref_PP->pos, Vec3f(1.0));
+
+                index_on_array = ref_PP->index + 1;
+
+                valid = true;
+            }
+            else if (PE == PrimEnum::DPRIM2_VVT)
+            {
+
+                cache.ptype = PrimEnum::DPRIM2_VVT;
+
+                PSP.add_P(ref_PP->pos, Vec3f(1.0));
+                PSP.add_P(ref_PP2->pos, Vec3f(1.0));
+
+                float len = (ref_PP2->E.p1 - ref_PP2->E.p0).length();
+
+                Vec3f &P_on_edge = features.feature_edge.E.marked_pos;
+
+                features.feature_JAC.constNormal =
+                    (P_on_edge - ref_PP->pos).cross((P_on_edge - ref_PP2->pos)).normalized();
+
+                B = ref_PP->BC + 2;
+
+                index_on_array = ref_PP->index + 2;
+
+                valid = true;
+            }
+        }
+
+        feature_blob features;
+
+        Vec2i comb_prim_id = Vec2i(-1, -1);
+        // ADV attribs only
+        class attrib_cache
+        {
+          public:
+            // depending on the type of prim, store the unchanging part
+            Vec3f const_JAC_portion_orig_prim = Vec3f(1.0f);
+
+            bool initialized = false;
+            PhotonPrimitiveSettings::Primitive_Combination *comb;
+            PhotonPrimitiveSettings::Primitive_Description *prim;
+            PhotonPrimitiveSettings::Primitive_Description::PrimType ptype;
+            arr<int> key_indices_in_PSP;
+
+            Vec3f dprev;
+            Box3f bbox;
+
+            // used for initializing key_indices_in_PSP only
+            int key_index_in_PSP(int which) const
+            {
+                auto &terms = prim->o_terms();
+                return terms[which].Ksi_pos + prim->o_seg_involved();
+            }
+        };
+
+        const Vec3f &key_vct_geo(int which) const
+        {
+            assert(cache.initialized);
+            return PSP_geo.V[cache.key_index_in_PSP(which)];
+        }
+
+        const Vec3f &key_vct(int which) const
+        {
+            assert(cache.initialized);
+            return PSP.V[cache.key_index_in_PSP(which)];
+        }
+
+        const Vec3f &key_pos(int which) const
+        {
+            assert(cache.initialized);
+            return PSP.P[cache.key_index_in_PSP(which)];
+        }
+
+        const Vec3f &key_dir(int which) const
+        {
+            assert(cache.initialized);
+            return PSP.D[cache.key_index_in_PSP(which)];
+        }
+
+        const Vec3f &key_dir_geo(int which) const
+        {
+            assert(cache.initialized);
+            return PSP_geo.D[cache.key_index_in_PSP(which)];
+        }
+
+        int key_index_RAW_array(int which) const
+        {
+            return index_head + cache.key_index_in_PSP(which);
+        }
+
+        PP &key_PP(int which)
+        {
+            return RAW_ARRAY[key_index_RAW_array(which)];
+        }
+
+        bool valid = false;
+
+        void reset_state()
+        {
+            valid = false;
+            features.clear_features();
+        }
+
+        void set_valid()
+        {
+            valid = true;
+        }
+
+        attrib_cache cache;
+
+        Box3f bbox()
+        {
+            // no direct access; use KVs instead
+
+            if (SETTINGS->is_on<PhotonPrimitiveSettings::switch_DEBUG>(
+                    int(PhotonPrimitiveSettings::switch_DEBUG::D_force_infBBOX)))
+                return BMAX;
+            else if (SETTINGS->is_on<PhotonPrimitiveSettings::switch_DEBUG>(
+                         int(PhotonPrimitiveSettings::switch_DEBUG::D_force_sceneBBOX)))
+                return BSCENE;
+            else
+                switch (cache.ptype)
+                {
+                case PrimEnum::PRIM3_PARALLELEPIPED:
+                {
+
+                    const Vec3f &v0 = KV_geo(0);
+                    const Vec3f &v1 = KV_geo(1);
+                    const Vec3f &v2 = KV_geo(2);
+
+                    Vec3f p0 = orig + v0;
+                    Vec3f p1 = orig + v1;
+                    Vec3f p2 = orig + v2;
+
+                    Vec3f p01 = p0 + v1;
+                    Vec3f p02 = p0 + v2;
+                    Vec3f p12 = p1 + v2;
+
+                    Vec3f p012 = p01 + v2;
+
+                    Box3f box;
+                    box.grow(orig);
+                    box.grow(p0);
+                    box.grow(p1);
+                    box.grow(p2);
+
+                    box.grow(p01);
+                    box.grow(p02);
+                    box.grow(p12);
+                    box.grow(p012);
+                    return box;
+                }
+
+                case PrimEnum::PRIM2_PLANE:
+                {
+                    const Vec3f &v0 = KV_geo(0);
+                    const Vec3f &v1 = KV_geo(1);
+                    Box3f box;
+
+                    box.grow(orig);
+                    box.grow(orig + v0);
+                    box.grow(orig + v1);
+                    box.grow(orig + v0 + v1);
+
+                    return box;
+                }
+
+                case PrimEnum::PRIM2_DISK:
+                {
+                    Vec3f v0 = KV_geo(0);
+                    Vec3f norm = cache.const_JAC_portion_orig_prim.normalized();
+                    Vec3f v1 = v0.cross(norm);
+
+                    v0 *= sqrtf(2.0f);
+                    v1 *= sqrtf(2.0f);
+
+                    Box3f box;
+
+                    box.grow(orig);
+                    box.grow(orig + v0);
+                    box.grow(orig + v1);
+                    box.grow(orig - v0);
+                    box.grow(orig - v1);
+
+                    return box;
+                }
+
+                    //use extended len
+                case PrimEnum::PRIM2_SPHERE:
+                case PrimEnum::PRIM3_SSPHERE:
+                {
+                    const Vec3f &v0 = KV_geo(0);
+                    Box3f box;
+
+                    Vec3f r0 = v0.length() * Vec3f(1.0f, 0.0f, 0.0f);
+                    Vec3f r1 = v0.length() * Vec3f(0.0f, 1.0f, 0.0f);
+                    Vec3f r2 = v0.length() * Vec3f(0.0f, 0.0f, 1.0f);
+
+                    box.grow(orig);
+                    box.grow(orig + r0);
+                    box.grow(orig + r1);
+                    box.grow(orig + r2);
+                    box.grow(orig - r0);
+                    box.grow(orig - r1);
+                    box.grow(orig - r2);
+
+                    return box;
+                }
+
+                case PrimEnum::PRIM2_CONE:
+                {
+                    Box3f box;
+                    box.grow(orig);
+
+                    Vec3f center_V = cache.dprev * (KV_geo(0).dot(cache.dprev));
+                    Vec3f r0 = (KV_geo(0) - center_V) * sqrtf(2.0f);
+                    Vec3f r1 = r0.cross(center_V.normalized());
+
+                    Vec3f center_P = orig + center_V;
+                    box.grow(center_P + r0);
+                    box.grow(center_P - r0);
+                    box.grow(center_P + r1);
+                    box.grow(center_P - r1);
+
+                    return box;
+                }
+                case PrimEnum::PRIM2_CYLINDER:
+                {
+
+                    Box3f box;
+
+                    Vec3f center_V = key_dir(0) * (KV_geo(1).dot(key_dir(0)));
+                    Vec3f r0 = (KV_geo(1) - center_V) * sqrtf(2.0f);
+                    Vec3f r1 = r0.cross(center_V.normalized());
+                    Vec3f center_P = orig + center_V;
+
+                    box.grow(center_P);
+                    box.grow(center_P + r0);
+                    box.grow(center_P - r0);
+                    box.grow(center_P + r1);
+                    box.grow(center_P - r1);
+
+                    Vec3f center_P2 = center_P + KV_geo(0);
+                    box.grow(center_P2 + r0);
+                    box.grow(center_P2 - r0);
+                    box.grow(center_P2 + r1);
+                    box.grow(center_P2 - r1);
+
+                    return box;
+                }
+
+                    // not quite correct; needs extending
+                case PrimEnum::DPRIM2_VE:
+                {
+                    if (cache.prim->has_long_dist())
+                    {
+                        return Box3f(Vec3f(-5.0f, -5.0f, -20.0f), Vec3f(5.0f, 5.0f, 20.0f));
+                    }
+                    Box3f box;
+
+                    box.grow(PSP[0]);
+
+                    // todo: short ver needs change
+                    Vec3f v0 = (features.feature_edge.E.p0 - PSP[0]).normalized() * 10;
+                    Vec3f v1 = (features.feature_edge.E.p1 - PSP[0]).normalized() * 10;
+
+                    box.grow(PSP[0] + v0);
+                    box.grow(PSP[0] + v1);
+
+                    return box;
+                }
+
+                case PrimEnum::DPRIM2_VVT:
+                {
+                    if (cache.prim->has_long_dist())
+                    {
+                        return Box3f(Vec3f(-5.0f, -5.0f, -20.0f), Vec3f(5.0f, 5.0f, 20.0f));
+                    }
+
+                    Box3f box;
+
+                    // todo: short ver needs change
+                    Vec3f e0 = (features.feature_edge.E.marked_pos - PSP[0]).normalized() * 10;
+                    Vec3f e1 = (features.feature_edge.E.marked_pos - PSP[1]).normalized() * 10;
+
+                    box.grow(features.feature_edge.E.marked_pos);
+                    box.grow(features.feature_edge.E.marked_pos + e0);
+                    box.grow(features.feature_edge.E.marked_pos + e1);
+
+                    return box;
+                }
+                }
+        }
+
+        enum WIP_diffprim
+        {
+            diff_uni_photon,
+            diff_uni_sensor,
+            diff_bi_photon,
+            diff_bi_sensor
+        };
+
+        static WIP_diffprim myprim;
+
+        static void initialize_globals(PP *headpt, const Box3f &scenebox, const Box3f &infbox,
+                                       PhotonPrimitiveSettings *PP_settings);
+    };
+
+    // use a proxy so that it doesn't always recompute
+    // try not to rely on PathPhoton too much; move most info inside
+    class PhotonPrimitive
+    {
+      private:
+        arr<float> const_JACs;
+
+        //GLOBALS
+        static bool GLOBALS_READY;
+        static Box3f BMAX;
+        static PathPhoton *RAW_ARRAY;
+        static PhotonMapSettings *SETTINGS;
+        static PhotonMapSettings::Primitive_Policy *EST;
+
+        bool valid = false;
+
+        // for most data: copy to PS
+        // the only data that requires extra lookup in PP: nvs
+
+        switch_field extra;
+
+        Box3f _bbox;
+        Mat4f _L2W, _W2L;
+        float _const_JAC;
+        arr<arr<Medium::NullVertex>> nv_array_ptr;
+
+        int bounce = -1;
+        int bounce_SS = -1;
+        int surfLen = -1;
+
+        //the photon at corresponding bounce
+        int32 I_mybounce = -1;
+
+        // might be earlier than p0
+        int32 I_mis = -1;
+        int32 I_LT = -1;
+
+        // reserve in init
+        // includes the photon replaced by analytical photon
+        arr<uint32> I_vtx;
+
+        // P is based on processed_origpath
+        arr<Vec3f> P;
+        arr<Vec3f> V;
+        arr<Vec3f> D;
+        arr<float> L;
+
+        // sometimes the geometry doesn't match the light path
+        // only for LS
+        arr<Vec3f> P_shape;
+        arr<Vec3f> V_shape;
+        arr<float> L_shape;
+
+        bool LS_related = false;
+
+        arr<Vec3f> processed_origpath;
+
+        Vec3f origin;
+
+        // default: only drawing one
+        bool multi_prim = false;
+
+        // which prim in which strat
+        Vec2i strat_prim;
+
+        Vec3f power;
+        float blur;
+
+        //DBG purpose
+        arr<PhotonBeam> dbg_beams;
+        arr<PathPhoton> dbg_points;
+
+      public:
+        const Vec3f &o_power() const
+        {
+            return power;
+        }
+
+        const Vec2i &o_strat_prim() const
+        {
+            return strat_prim;
+        }
+
+        Vec3f eval_as() {}
+
+        arr<Vec3f> &io_processed_path()
+        {
+            return processed_origpath;
+        }
+
+        enum extra_prim_feature
+        {
+            PS_bbox = 1,
+            PS_matrix = 2,
+            PS_constJAC = 4,
+            PS_nvs = 8,
+            PS_frame = 16
+        };
+
+        void enable_feature(extra_prim_feature ex)
+        {
+            extra.turn_on(ex);
+        }
+
+        void disable_feature(extra_prim_feature ex)
+        {
+            extra.turn_off(ex);
+        }
+
+        switch_field &io_extra()
+        {
+            return extra;
+        }
+
+        arr<PhotonBeam> &io_dbg_beams()
+        {
+            return dbg_beams;
+        }
+
+        const arr<PhotonBeam> &o_dbg_beams() const
+        {
+            return dbg_beams;
+        }
+
+        uint32 o_I_mybounce() const
+        {
+            return I_mybounce;
+        }
+
+        PathPhoton *o_RAW_ARRAY() const
+        {
+            return RAW_ARRAY;
+        }
+
+        static inline bool finite(float xx)
+        {
+            return (((xx <= INFINITY)) && ((xx >= -INFINITY)));
+        }
+
+        int o_bounce() const
+        {
+            return bounce;
+        }
+
+        int o_bounceSS() const
+        {
+            return bounce_SS;
+        }
+
+        PhotonPrimitive()
+        {
+            extra.turn_on(PS_bbox);
+            extra.turn_on(PS_frame);
+
+            valid = false;
+        }
+
+        void prep_size(int dim)
+        {
+            P.clear();
+            V.clear();
+            D.clear();
+            I_vtx.clear();
+            L.clear();
+
+            P.reserve(dim);
+            V.reserve(dim - 1);
+            D.reserve(dim - 1);
+            I_vtx.reserve(dim);
+            L.reserve(dim - 1);
+        }
+
+        void operator=(const PhotonPrimitive &PP)
+        {
+            P_shape = PP.P_shape;
+            V_shape = PP.V_shape;
+            L_shape = PP.L_shape;
+
+            LS_related = PP.LS_related;
+
+            dbg_beams = PP.dbg_beams;
+            dbg_points = PP.dbg_points;
+
+            valid = PP.valid;
+            extra = PP.extra;
+
+            _bbox = PP._bbox;
+            _L2W = PP._L2W;
+            _W2L = PP._W2L;
+            _const_JAC = PP._const_JAC;
+            nv_array_ptr = PP.nv_array_ptr;
+
+            bounce = PP.bounce;
+            bounce_SS = PP.bounce_SS;
+            surfLen = PP.surfLen;
+
+            I_mybounce = PP.I_mybounce;
+            I_mis = PP.I_mis;
+            I_LT = PP.I_LT;
+
+            I_vtx = PP.I_vtx;
+            P = PP.P;
+            V = PP.V;
+            D = PP.D;
+
+            origin = PP.origin;
+
+            multi_prim = PP.multi_prim;
+            strat_prim = PP.strat_prim;
+
+            power = PP.power;
+            blur = PP.blur;
+
+            const_JACs = PP.const_JACs;
+        }
+
+        PhotonPrimitive(const PhotonPrimitive &PP)
+        {
+            (*this) = PP;
+        }
+
+        void precompute_as_beam(const PathPhoton &p0, const PathPhoton &p1)
+        {
+            prep_size(2);
+
+            P[0] = p0.pos;
+            P[1] = p1.pos;
+            D[0] = p0.dir;
+            V[0] = D[0] * p0.length;
+
+            power = p0.power;
+            bounce = p0.bounce();
+            bounce_SS = p0.bounceSS();
+
+            valid = true;
+        }
+
+        /*  DATA
+	 *  null vertices
+	 *  valid
+	 *  bbox
+	 *  L2w, W2L
+	 *  const Jacobian
+	 */
+        inline const arr<Medium::NullVertex> *o_nvs(int i) const
+        {
+            return &nv_array_ptr[i];
+        }
+        inline Vec3f o_origin() const
+        {
+            assert(valid);
+            return origin;
+        }
+        inline bool o_valid() const
+        {
+            return valid;
+        }
+        inline Box3f &io_bbox()
+        {
+            return _bbox;
+        }
+        inline Mat4f &io_L2W()
+        {
+            return _L2W;
+        }
+        inline Mat4f &io_W2L()
+        {
+            return _W2L;
+        }
+        inline float &io_constJAC()
+        {
+            return _const_JAC;
+        }
+
+        /* Raw data access
+	 * PathPhoton from index
+	 * which -> PP index
+	 */
+        inline const PathPhoton &PP_indexed(uint32 loc) const
+        {
+            return RAW_ARRAY[loc];
+        }
+        /*0: head
+      last: the one corresponding to shading point */
+        inline uint32 getIndex(int which) const
+        {
+            assert(which < I_vtx.size());
+            return I_vtx[which];
+        }
+        /*Index*/
+        /* could include extra point samples */
+        inline uint32 getMISIndex() const
+        {
+            return I_mis;
+        }
+        /*depending on the dim, this might change*/
+        inline uint32 getHeadIndex() const
+        {
+            return I_vtx[0];
+        }
+        inline uint32 getTailIndex() const
+        {
+            return I_vtx.back();
+        }
+        inline uint32 get2ndIndex() const
+        {
+            return I_vtx[1];
+        }
+        inline uint32 get3rdIndex() const
+        {
+            return I_vtx[2];
+        }
+
+        /*Raw*/
+        /*Ptr*/
+        inline const PathPhoton *getPhotonPtr(int which) const
+        {
+            return RAW_ARRAY + getIndex(which);
+        }
+        inline const PathPhoton *getPhotonPtrOffset(int which, int offset) const
+        {
+            return getPhotonPtr(which) + offset;
+        }
+        inline const PathPhoton *getPhotonPtrNext(int which, int offset) const
+        {
+            return getPhotonPtr(which) + 1;
+        }
+        inline const PathPhoton *getPhotonPtrPrev(int which, int offset) const
+        {
+            return getPhotonPtr(which) - 1;
+        }
+        /*ref*/
+        inline const PathPhoton &getPhoton(int which) const
+        {
+            return *getPhotonPtr(which);
+        }
+        inline const PathPhoton &getPhotonOffset(int which, int offset) const
+        {
+            return *getPhotonPtrOffset(which, offset);
+        }
+        inline const PathPhoton &getPhotonNext(int which, int offset) const
+        {
+            return *getPhotonPtrNext(which, offset);
+        }
+        inline const PathPhoton &getPhotonPrev(int which, int offset) const
+        {
+            return *getPhotonPtrPrev(which, offset);
+        }
+
+        const PathPhoton &getHeadPhoton() const
+        {
+            return getPhoton(0);
+        }
+        const PathPhoton &get2ndPhoton() const
+        {
+            return getPhoton(1);
+        }
+        const PathPhoton &get3rdPhoton() const
+        {
+            return getPhoton(2);
+        }
+        const PathPhoton &getTailPhoton() const
+        {
+            return getPhoton(I_vtx.size());
+        }
+
+        static void initialize_globals(PathPhoton *headpt, const Box3f &scenebox, PhotonMapSettings *PST);
+
+        inline Vec3f &io_P(int which)
+        {
+            return P[which];
+        }
+        inline Vec3f &io_V(int which)
+        {
+            return V[which];
+        }
+        inline Vec3f &io_D(int which)
+        {
+            return D[which];
+        }
+
+        static void ray_from_to(const Vec3f &p1, const Vec3f &p2, Ray &ra)
+        {
+            Vec3f dif = (p2 - p1);
+            Vec3f difd = dif.normalized();
+
+            if (isnan(difd[0]))
+            {
+                difd = one_sq3;
+            }
+
+            ra.setPos(p1);
+            ra.setDir(difd);
+            ra.setNearT(1e-4f);
+            ra.setFarT(dif.length() - ra.nearT());
+        }
+
+        /* should work even without projecting*/
+        static Vec2f decomp_pl(const Vec3f &orig, const Vec3f &d0, const Vec3f &d1, const Vec3f &pt_on_pl)
+        {
+            Vec3f norm = (d0.cross(d1)).normalized();
+
+            float XX = (pt_on_pl - orig).dot(d0);
+            Vec3f Yaxis = norm.cross(d0).normalized();
+            float YY = (pt_on_pl - orig).dot(Yaxis);
+
+            float costheta = d1.dot(d0);
+            float sintheta = abs(d0.cross(d1).length());
+
+            Vec2f coords;
+
+            coords[0] = XX - YY * costheta / sintheta;
+            coords[1] = YY / sintheta;
+
+            return coords;
+        }
+
+        Box3f bounds_PLANE(bool has_longedge) const
+        {
+            float mpx[2] = {1.0, 1.0};
+
+            assert(valid);
+            Box3f box;
+
+            if (has_longedge)
+                return bounds_inf();
+
+            box.grow(origin);
+            box.grow(origin + V[0] * mpx[0]);
+            box.grow(origin + V[1] * mpx[1]);
+            box.grow(origin + V[0] * mpx[0] + V[1] * mpx[1]);
+
+            return box;
+        }
+
+        Box3f bounds_PARALLELEPIPED(bool has_longedge) const
+        {
+
+            float mpx[3] = {1.0, 1.0, 1.0};
+
+            assert(valid);
+            Box3f box;
+
+            if (has_longedge)
+                return bounds_inf();
+
+            // plane 1
+            box.grow(origin);
+            box.grow(origin + V[0] * mpx[0]);
+            box.grow(origin + V[1] * mpx[1]);
+            box.grow(origin + V[0] * mpx[0] + V[1] * mpx[1]);
+
+            // plane 2
+            box.grow(origin + V[2] * mpx[2]);
+            box.grow(origin + V[0] * mpx[0] + V[2] * mpx[2]);
+            box.grow(origin + V[1] * mpx[1] + V[2] * mpx[2]);
+            box.grow(origin + V[0] * mpx[0] + V[1] * mpx[1] + V[2] * mpx[2]);
+
+            return box;
+        }
+
+        Box3f bounds_for(const PhotonMapSettings::Primitive_Description *primtype) const
+        {
+            switch (primtype->o_primtype())
+            {
+                // already know it's plane/volume type, so there's no need to check for angle case
+            case PhotonMapSettings::Primitive_Description::PRIM2_PLANE:
+                return bounds_PLANE(primtype->o_terms()[0].SML == PhotonMapSettings::term::L ||
+                                    primtype->o_terms()[1].SML == PhotonMapSettings::term::L);
+
+            case PhotonMapSettings::Primitive_Description::PRIM3_PARALLELEPIPED:
+                return bounds_PARALLELEPIPED(primtype->o_terms()[0].SML == PhotonMapSettings::term::L ||
+                                             primtype->o_terms()[1].SML == PhotonMapSettings::term::L ||
+                                             primtype->o_terms()[2].SML == PhotonMapSettings::term::L);
+
+                // default: nothing
+                assert(false);
+                return Box3f();
+            }
+        }
+
+        const PhotonMapSettings::Primitive_Description *getPrimDrawn() const
+        {
+            const PhotonMapSettings::Primitive_Combination &cur_C = EST->o_strategies()[strat_prim[0]];
+            const PhotonMapSettings::Primitive_Description &cur_P = cur_C.o_prims()[strat_prim[1]];
+
+            return &(cur_P);
+        }
+
+        Box3f bounds() const
+        {
+            return bounds_for(getPrimDrawn());
+        }
+
+        // either PrimType or maybe complete type needed
+        // if the primitive is convex, only the type is needed, as looking at extra segs is unnecessary
+        Box3f bounds_convex(PhotonMapSettings::Primitive_Description::PrimType) const;
+        Box3f bounds_convex() const;
+        Box3f bounds_inf() const
+        {
+            return BMAX;
+        }
+
+        // for now, only drawing 1 prim
+        void prep_matrix_single(PhotonMapSettings::Primitive_Description::PrimType);
+
+        Vec3f eval_origin()
+        {
+            // needs data ready first
+            auto primtype = PhotonPrimitive::EST->o_strategies()[strat_prim[0]].o_prims()[strat_prim[1]];
+            auto terms = (primtype.o_terms());
+
+            Vec3f p = P.back();
+
+            assert(V.size() == primtype.o_affected_bounces_rel().size());
+
+            for (auto curV : V)
+            {
+                p -= curV;
+            }
+
+            return p;
+        }
+
+        void set_origin()
+        {
+            origin = eval_origin();
+        }
+
+        void precompute(int which_strat, int which_prim, int I_curbounce);
+
+        const Box3f o_BMAX() const
+        {
+            return BMAX;
+        }
+
+        void set_valid()
+        {
+            valid = true;
+        }
+        void set_invalid()
+        {
+            valid = false;
+        }
+
+        class intersection_solution
+        {
+          public:
+            class intersection_root
+            {
+              public:
+                Vec3f point;
+                float raydist;
+
+                /* plane: hitUV
+            // parallelepiped: hitUVW
+            // sphere/cone: dir
+            // cylinder: dist + dir */
+                Vec4f UVWT;
+
+                // mostly unused
+                Vec3f norm;
+
+                intersection_root()
+                {
+                    point = Vec3f(0.0f);
+                    raydist = 0.0f;
+                    UVWT = Vec4f(0.0f);
+                    norm = Vec3f(0.0f);
+                }
+
+                intersection_root(const intersection_root &ir)
+                {
+                    this->point = ir.point;
+                    this->raydist = ir.raydist;
+                    this->UVWT = ir.UVWT;
+                    this->norm = ir.norm;
+                }
+
+                // a sol for plane
+                intersection_root(Vec3f &point, float &raydist, Vec2f &Q_UV)
+                {
+                    this->point = point;
+                    this->raydist = raydist;
+                    this->UVWT[0] = Q_UV[0];
+                    this->UVWT[1] = Q_UV[1];
+                }
+            };
+
+            arr<intersection_root> roots;
+
+            void clear()
+            {
+                roots.clear();
+            }
+
+            intersection_solution() {}
+            intersection_solution(intersection_solution &&tmp) : roots(std::move(tmp.roots)) {}
+
+            // only for Q for now
+            void addroot(Vec3f &point, float &dist, Vec2f &UV)
+            {
+                roots.emplace_back(intersection_root(point, dist, UV));
+            }
+
+            void addroot(Ray &ray, float &dist, Vec2f &UV)
+            {
+                roots.emplace_back(intersection_root(ray.pos() + ray.dir() * dist, dist, UV));
+            }
+
+            void addroot(Vec3f &orig, Vec3f &d1, Vec3f &d2, float &dist, Vec2f &UV,
+                         PhotonMapSettings::Primitive_Description::PrimType pt)
+            {
+                // for now only has UV for planes
+                assert(pt == PhotonMapSettings::Primitive_Description::PRIM2_PLANE);
+
+                if (pt == PhotonMapSettings::Primitive_Description::PRIM2_PLANE)
+                    roots.emplace_back(intersection_root(orig + d1 * UV[0] + d2 * UV[1], dist, UV));
+            }
+        };
+
+        intersection_solution intersect(const Ray &in_eyeray, float tMin, float tMax) const
+        {
+            intersection_solution sol;
+
+            switch (this->getPrimDrawn()->o_primtype())
+            {
+            case PhotonMapSettings::Primitive_Description::PRIM2_PLANE:
+            {
+                Vec3f norm = (D[0].cross(D[1])).normalized();
+
+                float dist = (in_eyeray.pos() - origin).dot(norm) / (-in_eyeray.dir().dot(norm));
+
+                if (dist <= 0)
+                    return sol;
+
+                if (!finite(dist))
+                    return sol;
+
+                if (dist <= tMin || dist >= tMax)
+                    return sol;
+
+                Vec3f hitP = in_eyeray.pos() + dist * in_eyeray.dir();
+                Vec2f out_hitUV(-1, -1);
+
+                float XX = (hitP - origin).dot(D[0]);
+                Vec3f Yaxis = norm.cross(D[0]).normalized();
+                float YY = (hitP - origin).dot(Yaxis);
+
+                float costheta = D[1].dot(D[0]);
+                float sintheta = abs(D[0].cross(D[1]).length());
+
+                out_hitUV[0] = XX - YY * costheta / sintheta;
+                out_hitUV[1] = YY / sintheta;
+
+                if ((out_hitUV[0] >= 0) && (out_hitUV[1] >= 0))
+                {
+                    if ((out_hitUV[0] <= V[0].length()) && (out_hitUV[1] <= V[1].length()))
+
+                    {
+                        sol.addroot(hitP, dist, out_hitUV);
+                        return sol;
+                    }
+                }
+
+                return sol;
+                break;
+            }
+
+            case PhotonMapSettings::Primitive_Description::PRIM3_PARALLELEPIPED:
+
+                break;
+            }
+        }
+    };
+
+    struct PhotonVolume
+    {
+        // p: starting point of the volume
+        // a, b, c: three edges of the photon volume connecting with p
+        //         _____
+        //      v /    /|
+        //     p /____/
+        //       | w  | |
+        //     u |____|/
+        //
+
+        Vec3f p;
+        Vec3f a, b, c;
+
+        Vec3f aDir, bDir, cDir;
+        float aLen, bLen, cLen;
+
+        Vec3f powerOverDet;
+        int bounce;
+        bool valid;
+
+        Box3f bounds() const
+        {
+            Box3f box;
+            box.grow(p);
+            box.grow(p + a);
+            box.grow(p + b);
+            box.grow(p + c);
+            box.grow(p + a + b);
+            box.grow(p + a + c);
+            box.grow(p + b + c);
+            box.grow(p + a + b + c);
+            return box;
+        }
+    };
+
+} // namespace Tungsten
+
+#endif /* PHOTON_HPP_ */
